@@ -38,6 +38,7 @@ func ScanDirectory(rootPath string) ([]models.Project, error) {
 		"build":        {},
 		"vendor":       {},
 		".next":        {},
+		".vite":        {},
 	}
 
 	walkErr := filepath.WalkDir(rootPath, func(path string, d os.DirEntry, err error) error {

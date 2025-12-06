@@ -83,7 +83,10 @@ func (i projectItem) Title() string {
 
 // Description implements list.DefaultItem
 func (i projectItem) Description() string {
-	return fmt.Sprintf("[%s] %s", i.project.Status, i.project.Path)
+	if i.project.Path != "" {
+		return i.project.Path
+	}
+	return i.project.Status
 }
 
 var docStyle = lipgloss.NewStyle().Margin(1, 2)
@@ -109,13 +112,20 @@ const (
 
 // model represents the Bubble Tea application model
 type model struct {
-	screen          screenState
-	pathInput       textinput.Model
-	list            list.Model
-	errorMessage    string
-	statusMessage   string
-	isScanning      bool
-	confirmClearAll bool
+	screen              screenState
+	pathInput           textinput.Model
+	list                list.Model
+	errorMessage        string
+	statusMessage       string
+	isScanning          bool
+	confirmClearAll     bool
+	confirmArchive      bool
+	archiveConfirmInput textinput.Model
+	archiveProject      *projectItem
+	archiveIdx          int
+	width               int
+	height              int
+	ready               bool
 }
 
 // Init initializes the model and loads projects from the database
@@ -125,6 +135,23 @@ func (m model) Init() tea.Cmd {
 
 // Update handles messages and updates the model
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Handle window size first (applies to both screens)
+	if msg, ok := msg.(tea.WindowSizeMsg); ok {
+		m.width = msg.Width
+		m.height = msg.Height
+		m.ready = true
+
+		// Calculate available space for list (subtract margins, status, help)
+		listWidth := msg.Width - 4
+		listHeight := msg.Height - 8
+
+		if listHeight < 10 {
+			listHeight = 10
+		}
+
+		m.list.SetSize(listWidth, listHeight)
+	}
+
 	// Handle setup screen
 	if m.screen == screenSetup {
 		return m.updateSetup(msg)
@@ -133,12 +160,65 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Handle list screen
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		// If in archive confirmation mode, only handle enter and esc
+		if m.confirmArchive {
+			switch msg.String() {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "enter":
+				if m.archiveConfirmInput.Value() == "DELETE" {
+					// Confirmed - proceed with archive
+					originalItem := *m.archiveProject
+					originalIdx := m.archiveIdx
+
+					// OPTIMISTIC: Update the UI
+					m.archiveProject.project.Status = "archived"
+					m.archiveProject.isLoading = false
+					m.list.SetItem(originalIdx, *m.archiveProject)
+
+					// Clear confirmation state
+					m.confirmArchive = false
+					m.archiveProject = nil
+					m.errorMessage = ""
+
+					// Execute archive
+					return m, archiveProjectCmd(originalItem.project.ID, originalItem, originalIdx)
+				} else {
+					// Wrong text typed
+					m.errorMessage = "You must type 'DELETE' exactly to confirm"
+					return m, nil
+				}
+			case "esc":
+				m.confirmArchive = false
+				m.archiveProject = nil
+				m.statusMessage = "Archive cancelled"
+				m.errorMessage = ""
+				return m, nil
+			default:
+				// Pass other keys to the text input
+				var cmd tea.Cmd
+				m.archiveConfirmInput, cmd = m.archiveConfirmInput.Update(msg)
+				return m, cmd
+			}
+		}
+
+		// If list is filtering, let it handle all keys
+		if m.list.FilterState() == list.Filtering {
+			var cmd tea.Cmd
+			m.list, cmd = m.list.Update(msg)
+			return m, cmd
+		}
+
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
 
 		case "d":
-			// Archive (delete) the selected project - OPTIMISTIC UPDATE
+			// Archive (delete) the selected project - Show confirmation
+			if m.confirmArchive {
+				return m, nil // Already in confirmation mode
+			}
+
 			selectedItem := m.list.SelectedItem()
 			if selectedItem == nil {
 				return m, nil
@@ -149,20 +229,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
-			// Store original state for potential rollback
-			originalItem := item
-			originalIdx := m.list.Index()
+			// Enter confirmation mode
+			m.confirmArchive = true
+			itemCopy := item
+			m.archiveProject = &itemCopy
+			m.archiveIdx = m.list.Index()
+			m.errorMessage = ""
+			m.statusMessage = ""
 
-			// OPTIMISTIC: Immediately update the UI
-			item.project.Status = "archived"
-			item.isLoading = false
+			// Create confirmation input
+			confirmInput := textinput.New()
+			confirmInput.Placeholder = "Type DELETE to confirm"
+			confirmInput.Focus()
+			confirmInput.CharLimit = 10
+			confirmInput.Width = 30
+			m.archiveConfirmInput = confirmInput
 
-			// Update the item in the list
-			m.list.SetItem(originalIdx, item)
-			m.errorMessage = "" // Clear any previous errors
-
-			// Return command to archive in background
-			return m, archiveProjectCmd(item.project.ID, originalItem, originalIdx)
+			return m, textinput.Blink
 
 		case "r":
 			// Restore the selected project - OPTIMISTIC UPDATE
@@ -291,6 +374,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.statusMessage = fmt.Sprintf("Scan complete: Found %d projects, added %d new", msg.projectsFound, msg.projectsAdded)
 			m.errorMessage = ""
+			// Switch to list view if we're on setup screen
+			if m.screen == screenSetup {
+				m.screen = screenList
+			}
 			// Reload the list
 			return m, reloadProjectsCmd()
 		}
@@ -323,10 +410,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case ErrorMsg:
 		m.errorMessage = msg.err.Error()
 		return m, nil
-
-	case tea.WindowSizeMsg:
-		h, v := docStyle.GetFrameSize()
-		m.list.SetSize(msg.Width-h, msg.Height-v)
 	}
 
 	var cmd tea.Cmd
@@ -449,6 +532,11 @@ func (m model) viewSetup() string {
 
 // viewList renders the project list screen
 func (m model) viewList() string {
+	// If not ready, show loading state
+	if !m.ready {
+		return "Loading..."
+	}
+
 	view := m.list.View()
 
 	// Display error message if present
@@ -474,6 +562,47 @@ func (m model) viewList() string {
 			Render("\n\n✓ " + m.statusMessage)
 	}
 
+	// Add archive confirmation dialog if in archive mode
+	archivePrompt := ""
+	if m.confirmArchive && m.archiveProject != nil {
+		hasRepoURL := m.archiveProject.project.RepoURL != ""
+
+		titleStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FF0000")).
+			Bold(true)
+
+		infoStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFFFFF"))
+
+		restoreInfoStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#00AA00"))
+
+		noRestoreStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFAA00"))
+
+		archivePrompt = "\n\n" +
+			titleStyle.Render("⚠ WARNING: ARCHIVE PROJECT") + "\n\n" +
+			infoStyle.Render(fmt.Sprintf("Project: %s\n", m.archiveProject.project.Name)) +
+			infoStyle.Render(fmt.Sprintf("Path: %s\n\n", m.archiveProject.project.Path))
+
+		if hasRepoURL {
+			archivePrompt += restoreInfoStyle.Render("✓ This project CAN be restored from:\n") +
+				restoreInfoStyle.Render(fmt.Sprintf("  %s\n\n", m.archiveProject.project.RepoURL))
+		} else {
+			archivePrompt += noRestoreStyle.Render("⚠ WARNING: No git repository URL found!\n") +
+				noRestoreStyle.Render("  This project CANNOT be restored after archiving.\n\n")
+		}
+
+		archivePrompt += lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FF0000")).
+			Bold(true).
+			Render("Type 'DELETE' to confirm archive: ") + "\n" +
+			m.archiveConfirmInput.View() + "\n\n" +
+			lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#888888")).
+				Render("Press Enter to confirm | ESC to cancel")
+	}
+
 	// Add confirmation prompt if in clear all mode
 	confirmPrompt := ""
 	if m.confirmClearAll {
@@ -491,7 +620,8 @@ func (m model) viewList() string {
 		Foreground(lipgloss.Color("#888888")).
 		Render("\n\nKeys: enter=open  s=scan  c=clear-all  d=archive  r=restore  /=filter  q=quit")
 
-	return docStyle.Render(view + scanIndicator + statusView + confirmPrompt + helpText)
+	// Build output without extra docStyle wrapping to avoid layout issues
+	return view + scanIndicator + statusView + archivePrompt + confirmPrompt + helpText
 }
 
 // NewModel creates a new model with projects loaded from the database
@@ -502,12 +632,13 @@ func NewModel() (model, error) {
 		return model{}, fmt.Errorf("failed to load projects: %w", err)
 	}
 
-	// Create the list
+	// Create the list with reasonable default dimensions
 	delegate := list.NewDefaultDelegate()
-	l := list.New([]list.Item{}, delegate, 0, 0)
+	l := list.New([]list.Item{}, delegate, 80, 20)
 	l.Title = "DevBase - Project Manager"
 	l.SetShowStatusBar(true)
 	l.SetFilteringEnabled(true)
+	l.SetShowHelp(false)
 
 	// If database is empty, start with setup screen
 	if len(projects) == 0 {
@@ -530,6 +661,9 @@ func NewModel() (model, error) {
 			errorMessage:  "",
 			statusMessage: "",
 			isScanning:    false,
+			width:         80,
+			height:        24,
+			ready:         false,
 		}, nil
 	}
 
@@ -547,6 +681,9 @@ func NewModel() (model, error) {
 		errorMessage:  "",
 		statusMessage: "",
 		isScanning:    false,
+		width:         80,
+		height:        24,
+		ready:         false,
 	}, nil
 }
 
