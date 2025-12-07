@@ -48,6 +48,12 @@ type OpenProjectMsg struct {
 	err       error
 }
 
+// OpenBrowserMsg is sent when opening a URL in the browser completes
+type OpenBrowserMsg struct {
+	url string
+	err error
+}
+
 // ScanCompleteMsg is sent when directory scan completes
 type ScanCompleteMsg struct {
 	projectsFound   int
@@ -391,6 +397,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			return m, textinput.Blink
 
+		case "o":
+			// Open GitHub repository URL in default browser
+			selectedItem := m.list.SelectedItem()
+			if selectedItem == nil {
+				return m, nil
+			}
+
+			item, ok := selectedItem.(projectItem)
+			if !ok {
+				return m, nil
+			}
+
+			if item.project.RepoURL == "" {
+				m.errorMessage = "No repository URL found for this project"
+				return m, nil
+			}
+
+			m.errorMessage = "" // Clear any previous errors
+			m.statusMessage = "Opening repository in browser..."
+
+			// Open URL in default browser
+			return m, openBrowserCmd(item.project.RepoURL)
+
 		case "c":
 			// Clear all projects - ask for confirmation
 			if !m.confirmClearAll {
@@ -460,6 +489,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.errorMessage = fmt.Sprintf("Failed to open VS Code: %v", msg.err)
 		} else {
 			m.errorMessage = "" // Clear error on success
+		}
+		return m, nil
+
+	case OpenBrowserMsg:
+		// Handle browser open completion
+		if msg.err != nil {
+			m.errorMessage = fmt.Sprintf("Failed to open browser: %v", msg.err)
+		} else {
+			m.errorMessage = "" // Clear error on success
+			m.statusMessage = "Repository opened in browser"
 		}
 		return m, nil
 
@@ -753,7 +792,7 @@ func (m model) viewList() string {
 	// Add help text
 	helpText := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#888888")).
-		Render("\n\nKeys: enter=open  s=scan  g=clone  c=clear-all  d=archive  r=restore  /=filter  q=quit")
+		Render("\n\nKeys: enter=open  o=browser  s=scan  g=clone  c=clear-all  d=archive  r=restore  /=filter  q=quit")
 
 	// Build output without extra docStyle wrapping to avoid layout issues
 	return view + scanIndicator + statusView + clonePrompt + archivePrompt + confirmPrompt + helpText
@@ -870,6 +909,19 @@ func openProjectCmd(projectID uint, path string) tea.Cmd {
 		return OpenProjectMsg{
 			projectID: projectID,
 			err:       err,
+		}
+	}
+}
+
+// openBrowserCmd creates a command that opens a URL in the default browser
+func openBrowserCmd(url string) tea.Cmd {
+	return func() tea.Msg {
+		// Open URL in default browser using PowerShell's Start-Process
+		cmd := exec.Command("powershell", "-Command", "Start-Process", url)
+		err := cmd.Start()
+		return OpenBrowserMsg{
+			url: url,
+			err: err,
 		}
 	}
 }
