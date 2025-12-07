@@ -1,0 +1,93 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (uncomment if using vendoring)
+# vendor/
+
+# Go workspace file
+go.work
+
+# Go build cache
+.cache/
+
+# SQLite database files
+*.db
+*.db-*
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Log files
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Windows system files
+Desktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# Build artifacts and distribution files
+dist/
+build/
+*.tar.gz
+*.zip
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Test data and fixtures
+testdata/
+fixtures/
+
+# Coverage reports
+coverage.html
+coverage.xml
+*.cover
+
+# Benchmark results
+bench.out
+
+# Go module proxy cache
+/pkg/
+
+# Air live reload tool
+tmp/</content>
+<parameter name="filePath">d:\WigerLabs\Projects\CLI_tools\DevBase\.gitignore
