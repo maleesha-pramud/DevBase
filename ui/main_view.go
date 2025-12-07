@@ -54,6 +54,12 @@ type OpenBrowserMsg struct {
 	err error
 }
 
+// RunProjectMsg is sent when running a project completes
+type RunProjectMsg struct {
+	projectPath string
+	err         error
+}
+
 // ScanCompleteMsg is sent when directory scan completes
 type ScanCompleteMsg struct {
 	projectsFound   int
@@ -420,6 +426,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Open URL in default browser
 			return m, openBrowserCmd(item.project.RepoURL)
 
+		case "x":
+			// Run/execute the selected project
+			selectedItem := m.list.SelectedItem()
+			if selectedItem == nil {
+				return m, nil
+			}
+
+			item, ok := selectedItem.(projectItem)
+			if !ok {
+				return m, nil
+			}
+
+			m.errorMessage = "" // Clear any previous errors
+			m.statusMessage = "Opening new terminal window to run project in development mode..."
+
+			// Run the project
+			return m, runProjectCmd(item.project.Path)
+
 		case "c":
 			// Clear all projects - ask for confirmation
 			if !m.confirmClearAll {
@@ -499,6 +523,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.errorMessage = "" // Clear error on success
 			m.statusMessage = "Repository opened in browser"
+		}
+		return m, nil
+
+	case RunProjectMsg:
+		// Handle project run completion
+		if msg.err != nil {
+			m.errorMessage = fmt.Sprintf("Failed to open terminal: %v", msg.err)
+		} else {
+			m.errorMessage = "" // Clear error on success
+			m.statusMessage = "Development terminal opened - project is running in dev mode"
 		}
 		return m, nil
 
@@ -792,7 +826,7 @@ func (m model) viewList() string {
 	// Add help text
 	helpText := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#888888")).
-		Render("\n\nKeys: enter=open  o=browser  s=scan  g=clone  c=clear-all  d=archive  r=restore  /=filter  q=quit")
+		Render("\n\nKeys: enter=open  o=browser  x=run  s=scan  g=clone  c=clear-all  d=archive  r=restore  /=filter  q=quit")
 
 	// Build output without extra docStyle wrapping to avoid layout issues
 	return view + scanIndicator + statusView + clonePrompt + archivePrompt + confirmPrompt + helpText
@@ -924,6 +958,124 @@ func openBrowserCmd(url string) tea.Cmd {
 			err: err,
 		}
 	}
+}
+
+// runProjectCmd creates a command that runs/executes a project in a new terminal window
+func runProjectCmd(projectPath string) tea.Cmd {
+	return func() tea.Msg {
+		// Detect project type and get the run command
+		cmd, err := detectAndCreateRunCommand(projectPath)
+		if err != nil {
+			return RunProjectMsg{
+				projectPath: projectPath,
+				err:         err,
+			}
+		}
+
+		// Build the full command string
+		args := strings.Join(cmd.Args, " ")
+		fullCommand := fmt.Sprintf("cd /d %s && %s", projectPath, args)
+
+		// Open new terminal window with the command
+		// Use cmd /c start cmd /k to open a new cmd window that stays open
+		terminalCmd := exec.Command("cmd", "/c", "start", "cmd", "/k", fullCommand)
+
+		err = terminalCmd.Start()
+		return RunProjectMsg{
+			projectPath: projectPath,
+			err:         err,
+		}
+	}
+}
+
+// getNpmDevCommand checks if package.json has a dev script and returns appropriate npm command
+func getNpmDevCommand(projectPath string) string {
+	packageJsonPath := filepath.Join(projectPath, "package.json")
+
+	// Read package.json
+	content, err := os.ReadFile(packageJsonPath)
+	if err != nil {
+		return "npm start" // fallback
+	}
+
+	// Simple check for "dev" script - look for "dev" in scripts section
+	contentStr := string(content)
+	if strings.Contains(contentStr, `"dev"`) && strings.Contains(contentStr, `"scripts"`) {
+		return "npm run dev"
+	}
+
+	return "npm start" // fallback to start
+}
+
+// getPythonDevCommand checks for Python framework specific development commands
+func getPythonDevCommand(projectPath string) string {
+	// Check for Django manage.py
+	if _, err := os.Stat(filepath.Join(projectPath, "manage.py")); err == nil {
+		return "python manage.py runserver"
+	}
+
+	// Check for Flask app.py with debug mode
+	if _, err := os.Stat(filepath.Join(projectPath, "app.py")); err == nil {
+		return "python -c \"from app import app; app.run(debug=True)\""
+	}
+
+	// Check for main.py
+	if _, err := os.Stat(filepath.Join(projectPath, "main.py")); err == nil {
+		return "python main.py"
+	}
+
+	// Fallback
+	return "python -m main"
+}
+
+// detectAndCreateRunCommand detects project type and creates appropriate run command
+func detectAndCreateRunCommand(projectPath string) (*exec.Cmd, error) {
+	// Check for Go project
+	if _, err := os.Stat(filepath.Join(projectPath, "go.mod")); err == nil {
+		// Go project - install dependencies and run
+		mainFiles, err := filepath.Glob(filepath.Join(projectPath, "cmd", "*", "main.go"))
+		if err == nil && len(mainFiles) > 0 {
+			return exec.Command("powershell", "-Command", "go mod download && go run "+mainFiles[0]), nil
+		}
+		// Fallback to go run .
+		return exec.Command("powershell", "-Command", "go mod download && go run ."), nil
+	}
+
+	// Check for Node.js project
+	if _, err := os.Stat(filepath.Join(projectPath, "package.json")); err == nil {
+		// Check if there's a dev script, otherwise use start
+		devCommand := getNpmDevCommand(projectPath)
+		return exec.Command("powershell", "-Command", "npm install && "+devCommand), nil
+	}
+
+	// Check for Python project
+	if _, err := os.Stat(filepath.Join(projectPath, "requirements.txt")); err == nil {
+		// Check for Flask app.py or Django manage.py
+		devCommand := getPythonDevCommand(projectPath)
+		return exec.Command("powershell", "-Command", "pip install -r requirements.txt && "+devCommand), nil
+	}
+
+	// Check for Rust project
+	if _, err := os.Stat(filepath.Join(projectPath, "Cargo.toml")); err == nil {
+		return exec.Command("powershell", "-Command", "cargo build && cargo run"), nil
+	}
+
+	// Check for .NET project
+	if matches, _ := filepath.Glob(filepath.Join(projectPath, "*.csproj")); len(matches) > 0 {
+		return exec.Command("powershell", "-Command", "dotnet restore && dotnet watch run"), nil
+	}
+
+	// Check for Java Maven project
+	if _, err := os.Stat(filepath.Join(projectPath, "pom.xml")); err == nil {
+		return exec.Command("powershell", "-Command", "mvn dependency:resolve && mvn exec:java"), nil
+	}
+
+	// Check for Java Gradle project
+	if _, err := os.Stat(filepath.Join(projectPath, "build.gradle")); err == nil {
+		return exec.Command("powershell", "-Command", "./gradlew build && ./gradlew run"), nil
+	}
+
+	return nil, fmt.Errorf("unable to detect project type or run command")
 }
 
 // scanProjectsWithPathCmd creates a command that scans for projects at a specific path
