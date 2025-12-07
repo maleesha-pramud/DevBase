@@ -74,6 +74,30 @@ type ClearAllMsg struct {
 	err   error
 }
 
+// SyncToCloudMsg is sent when syncing projects to cloud completes
+type SyncToCloudMsg struct {
+	gistID string
+	err    error
+}
+
+// LoadFromCloudMsg is sent when loading projects from cloud completes
+type LoadFromCloudMsg struct {
+	projectsLoaded int
+	err            error
+}
+
+// ListCloudProjectsMsg is sent when listing projects from cloud completes
+type ListCloudProjectsMsg struct {
+	projects []models.Project
+	err      error
+}
+
+// LoadSelectedProjectsMsg is sent when loading selected projects from cloud completes
+type LoadSelectedProjectsMsg struct {
+	projectsLoaded int
+	err            error
+}
+
 // projectItem wraps a Project and implements the list.Item interface
 type projectItem struct {
 	project   models.Project
@@ -137,7 +161,9 @@ var subtitleStyle = lipgloss.NewStyle().
 type screenState int
 
 const (
-	screenSetup screenState = iota
+	screenSetupPath screenState = iota
+	screenSetupToken
+	screenCloudSelect
 	screenList
 )
 
@@ -150,23 +176,26 @@ type CloneMsg struct {
 
 // model represents the Bubble Tea application model
 type model struct {
-	screen              screenState
-	pathInput           textinput.Model
-	list                list.Model
-	errorMessage        string
-	statusMessage       string
-	isScanning          bool
-	confirmClearAll     bool
-	confirmArchive      bool
-	archiveConfirmInput textinput.Model
-	archiveProject      *projectItem
-	archiveIdx          int
-	confirmClone        bool
-	cloneInput          textinput.Model
-	rootScanPath        string
-	width               int
-	height              int
-	ready               bool
+	screen               screenState
+	pathInput            textinput.Model
+	tokenInput           textinput.Model
+	list                 list.Model
+	errorMessage         string
+	statusMessage        string
+	isScanning           bool
+	confirmClearAll      bool
+	confirmArchive       bool
+	archiveConfirmInput  textinput.Model
+	archiveProject       *projectItem
+	archiveIdx           int
+	confirmClone         bool
+	cloneInput           textinput.Model
+	cloudProjects        []models.Project
+	selectedCloudIndices []int
+	rootScanPath         string
+	width                int
+	height               int
+	ready                bool
 }
 
 // Init initializes the model and loads projects from the database
@@ -194,8 +223,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	// Handle setup screen
-	if m.screen == screenSetup {
+	if m.screen == screenSetupPath || m.screen == screenSetupToken {
 		return m.updateSetup(msg)
+	}
+
+	// Handle cloud select screen
+	if m.screen == screenCloudSelect {
+		return m.updateCloudSelect(msg)
 	}
 
 	// Handle list screen
@@ -457,6 +491,42 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusMessage = "Clearing all projects..."
 			return m, clearAllProjectsCmd()
 
+		case "u":
+			// Check if GitHub token is configured
+			if token, err := db.GetConfig("github_token"); err != nil || token == "" {
+				m.errorMessage = "GitHub token not configured. Press 't' to configure token."
+				return m, nil
+			}
+			// Sync to cloud (upload projects to GitHub Gist)
+			m.errorMessage = ""
+			m.statusMessage = "Syncing projects to cloud..."
+			return m, syncToCloudCmd()
+
+		case "l":
+			// Check if GitHub token is configured
+			if token, err := db.GetConfig("github_token"); err != nil || token == "" {
+				m.errorMessage = "GitHub token not configured. Press 't' to configure token."
+				return m, nil
+			}
+			// List projects from cloud
+			m.errorMessage = ""
+			m.statusMessage = "Loading projects from cloud..."
+			return m, listCloudProjectsCmd()
+
+		case "t":
+			// Configure GitHub token
+			m.screen = screenSetupToken
+			// Initialize token input
+			ti := textinput.New()
+			ti.Placeholder = "Enter GitHub Personal Access Token"
+			ti.Focus()
+			ti.CharLimit = 256
+			ti.Width = 60
+			m.tokenInput = ti
+			m.errorMessage = ""
+			m.statusMessage = ""
+			return m, textinput.Blink
+
 		case "esc":
 			// Cancel clear all confirmation
 			if m.confirmClearAll {
@@ -550,7 +620,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.errorMessage = ""
 			// Switch to list view if we're on setup screen
-			if m.screen == screenSetup {
+			if m.screen == screenSetupPath || m.screen == screenSetupToken {
 				m.screen = screenList
 			}
 			// Reload the list
@@ -569,7 +639,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Clear the list
 			m.list.SetItems([]list.Item{})
 			// Switch to setup screen
-			m.screen = screenSetup
+			m.screen = screenSetupPath
 
 			// Create and focus new path input
 			ti := textinput.New()
@@ -595,6 +665,58 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.list.SetItems(msg.items)
 		return m, nil
 
+	case SyncToCloudMsg:
+		// Handle sync to cloud completion
+		if msg.err != nil {
+			m.errorMessage = fmt.Sprintf("Sync to cloud failed: %v", msg.err)
+			m.statusMessage = ""
+		} else {
+			m.errorMessage = ""
+			m.statusMessage = fmt.Sprintf("Projects synced to cloud (Gist ID: %s)", msg.gistID)
+			// Save the gist ID to config
+			go db.SetConfig("gist_id", msg.gistID)
+		}
+		return m, nil
+
+	case LoadFromCloudMsg:
+		// Handle load from cloud completion
+		if msg.err != nil {
+			m.errorMessage = fmt.Sprintf("Load from cloud failed: %v", msg.err)
+			m.statusMessage = ""
+		} else {
+			m.errorMessage = ""
+			m.statusMessage = fmt.Sprintf("Loaded %d projects from cloud", msg.projectsLoaded)
+			// Reload the list to show loaded projects
+			return m, reloadProjectsCmd()
+		}
+		return m, nil
+
+	case ListCloudProjectsMsg:
+		// Handle list cloud projects completion
+		if msg.err != nil {
+			m.errorMessage = fmt.Sprintf("Failed to list cloud projects: %v", msg.err)
+			m.statusMessage = ""
+			return m, nil
+		}
+		m.cloudProjects = msg.projects
+		m.selectedCloudIndices = []int{}
+		m.screen = screenCloudSelect
+		m.statusMessage = ""
+		m.errorMessage = ""
+		return m, nil
+
+	case LoadSelectedProjectsMsg:
+		// Handle load selected projects completion
+		if msg.err != nil {
+			m.errorMessage = fmt.Sprintf("Failed to load selected projects: %v", msg.err)
+			m.statusMessage = ""
+			return m, nil
+		}
+		m.statusMessage = fmt.Sprintf("Loaded %d projects from cloud (marked as archived)", msg.projectsLoaded)
+		m.errorMessage = ""
+		// Reload the list to show the new archived projects
+		return m, reloadProjectsCmd()
+
 	case ErrorMsg:
 		m.errorMessage = msg.err.Error()
 		return m, nil
@@ -610,21 +732,54 @@ func (m model) updateSetup(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "ctrl+c", "q":
+		case "ctrl+c":
 			return m, tea.Quit
 		case "enter":
-			// Start scanning with the entered path
-			if m.pathInput.Value() == "" {
-				m.errorMessage = "Please enter a valid path"
+			if m.screen == screenSetupPath {
+				// Handle path input
+				if m.pathInput.Value() == "" {
+					m.errorMessage = "Please enter a valid path"
+					return m, nil
+				}
+				m.isScanning = true
+				m.statusMessage = "Scanning for projects..."
+				m.errorMessage = ""
+				m.rootScanPath = m.pathInput.Value()
+				// Save root path to config
+				_ = db.SetConfig("root_scan_path", m.pathInput.Value())
+				return m, scanProjectsWithPathCmd(m.pathInput.Value())
+			} else if m.screen == screenSetupToken {
+				// Handle token input
+				token := m.tokenInput.Value()
+				if token == "" {
+					// Skip token setup if empty
+					m.screen = screenList
+					return m, nil
+				}
+
+				// Validate token before saving
+				validationClient := engine.NewGistClient(token)
+				if err := validationClient.ValidateToken(); err != nil {
+					m.errorMessage = "Invalid GitHub token. Please check your token and try again."
+					return m, nil
+				}
+
+				// Save token to config
+				_ = db.SetConfig("github_token", token)
+				m.statusMessage = "GitHub token configured successfully"
+				m.errorMessage = ""
+				m.screen = screenList
 				return m, nil
 			}
-			m.isScanning = true
-			m.statusMessage = "Scanning for projects..."
-			m.errorMessage = ""
-			m.rootScanPath = m.pathInput.Value()
-			// Save root path to config
-			_ = db.SetConfig("root_scan_path", m.pathInput.Value())
-			return m, scanProjectsWithPathCmd(m.pathInput.Value())
+		default:
+			// For any other key, pass it to the appropriate text input
+			var cmd tea.Cmd
+			if m.screen == screenSetupPath {
+				m.pathInput, cmd = m.pathInput.Update(msg)
+			} else if m.screen == screenSetupToken {
+				m.tokenInput, cmd = m.tokenInput.Update(msg)
+			}
+			return m, cmd
 		}
 
 	case ScanCompleteMsg:
@@ -636,9 +791,16 @@ func (m model) updateSetup(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.statusMessage = fmt.Sprintf("Found %d projects, added %d to database", msg.projectsFound, msg.projectsAdded)
-		// Switch to list screen
-		m.screen = screenList
-		return m, reloadProjectsCmd()
+		// Switch to token setup screen
+		m.screen = screenSetupToken
+		// Initialize token input
+		ti := textinput.New()
+		ti.Placeholder = "Enter GitHub Personal Access Token (optional)"
+		ti.Focus()
+		ti.CharLimit = 256
+		ti.Width = 60
+		m.tokenInput = ti
+		return m, textinput.Blink
 
 	case reloadMsg:
 		// Load projects into list and switch to list screen
@@ -647,15 +809,83 @@ func (m model) updateSetup(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	var cmd tea.Cmd
-	m.pathInput, cmd = m.pathInput.Update(msg)
-	return m, cmd
+	return m, nil
+}
+
+// updateCloudSelect handles updates for the cloud project selection screen
+func (m model) updateCloudSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c", "q":
+			m.screen = screenList
+			m.cloudProjects = nil
+			m.selectedCloudIndices = nil
+			return m, nil
+
+		case "enter":
+			if len(m.selectedCloudIndices) == 0 {
+				m.errorMessage = "Please select at least one project"
+				return m, nil
+			}
+			// Load selected projects
+			return m, loadSelectedProjectsCmd(m.selectedCloudIndices, m.cloudProjects)
+
+		case "esc":
+			m.screen = screenList
+			m.cloudProjects = nil
+			m.selectedCloudIndices = nil
+			return m, nil
+
+		default:
+			// Handle number keys for selection (1-9)
+			if len(msg.String()) == 1 {
+				num := int(msg.String()[0] - '0')
+				if num >= 1 && num <= len(m.cloudProjects) {
+					idx := num - 1
+					// Toggle selection
+					found := false
+					for i, selectedIdx := range m.selectedCloudIndices {
+						if selectedIdx == idx {
+							// Remove from selection
+							m.selectedCloudIndices = append(m.selectedCloudIndices[:i], m.selectedCloudIndices[i+1:]...)
+							found = true
+							break
+						}
+					}
+					if !found {
+						// Add to selection
+						m.selectedCloudIndices = append(m.selectedCloudIndices, idx)
+					}
+					return m, nil
+				}
+			}
+		}
+
+	case LoadSelectedProjectsMsg:
+		if msg.err != nil {
+			m.errorMessage = fmt.Sprintf("Failed to load selected projects: %v", msg.err)
+			return m, nil
+		}
+		m.statusMessage = fmt.Sprintf("Loaded %d projects from cloud (marked as archived)", msg.projectsLoaded)
+		m.errorMessage = ""
+		m.screen = screenList
+		m.cloudProjects = nil
+		m.selectedCloudIndices = nil
+		// Reload the list to show the new archived projects
+		return m, reloadProjectsCmd()
+	}
+
+	return m, nil
 }
 
 // View renders the UI
 func (m model) View() string {
-	if m.screen == screenSetup {
+	if m.screen == screenSetupPath || m.screen == screenSetupToken {
 		return m.viewSetup()
+	}
+	if m.screen == screenCloudSelect {
+		return m.viewCloudSelect()
 	}
 	return m.viewList()
 }
@@ -664,30 +894,71 @@ func (m model) View() string {
 func (m model) viewSetup() string {
 	var s string
 
-	// Title
-	title := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#00FFFF")).
-		Bold(true).
-		Render("\n╔═══════════════════════════════════════════════════════════╗\n" +
-			"║              Welcome to DevBase v1.0.0                  ║\n" +
-			"╚═══════════════════════════════════════════════════════════╝\n")
-	s += title
+	if m.screen == screenSetupPath {
+		// Title
+		title := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#00FFFF")).
+			Bold(true).
+			Render("\n╔═══════════════════════════════════════════════════════════╗\n" +
+				"║              Welcome to DevBase v1.0.0                  ║\n" +
+				"╚═══════════════════════════════════════════════════════════╝\n")
+		s += title
 
-	// Prompt
-	prompt := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#FFFFFF")).
-		Render("\nEnter the root folder path for your projects:\n")
-	s += prompt
+		// Prompt
+		prompt := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Render("\nEnter the root folder path for your projects:\n")
+		s += prompt
 
-	// Hint
-	hint := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#888888")).
-		Italic(true).
-		Render("(e.g., D:\\\\Projects or C:\\\\Users\\\\YourName\\\\workspace)\n\n")
-	s += hint
+		// Hint
+		hint := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#888888")).
+			Italic(true).
+			Render("(e.g., D:\\\\Projects or C:\\\\Users\\\\YourName\\\\workspace)\n\n")
+		s += hint
 
-	// Input field
-	s += m.pathInput.View() + "\n"
+		// Input field
+		s += m.pathInput.View() + "\n"
+
+		// Help text
+		helpText := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#888888")).
+			Render("\nPress Enter to start scan | Ctrl+C to quit")
+		s += helpText
+
+	} else if m.screen == screenSetupToken {
+		// Title
+		title := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#00FFFF")).
+			Bold(true).
+			Render("\n╔═══════════════════════════════════════════════════════════╗\n" +
+				"║            Configure GitHub Integration                 ║\n" +
+				"╚═══════════════════════════════════════════════════════════╝\n")
+		s += title
+
+		// Prompt
+		prompt := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Render("\nEnter your GitHub Personal Access Token for cloud sync:\n")
+		s += prompt
+
+		// Info
+		info := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#888888")).
+			Render("This enables syncing your projects to GitHub Gists.\n" +
+				"Create a token at: https://github.com/settings/tokens\n" +
+				"Required scopes: gist (read/write)\n\n")
+		s += info
+
+		// Input field
+		s += m.tokenInput.View() + "\n"
+
+		// Help text
+		helpText := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#888888")).
+			Render("\nPress Enter to save (leave empty to skip) | Ctrl+C to quit")
+		s += helpText
+	}
 
 	// Display error message if present
 	if m.errorMessage != "" {
@@ -712,11 +983,74 @@ func (m model) viewSetup() string {
 		s += scanIndicator
 	}
 
+	return docStyle.Render(s)
+}
+
+// viewCloudSelect renders the cloud project selection screen
+func (m model) viewCloudSelect() string {
+	// Title box
+	titleBox := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#00FFFF")).
+		Padding(0, 1).
+		Bold(true).
+		Render("Select Projects from Cloud")
+
+	s := titleBox + "\n\n"
+
+	// Instructions
+	instructions := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#FFFFFF")).
+		Render("Select projects to load from cloud (they will be marked as archived):\n\n")
+	s += instructions
+
+	// Calculate max name length for alignment
+	maxLen := 0
+	for _, project := range m.cloudProjects {
+		if len(project.Name) > maxLen {
+			maxLen = len(project.Name)
+		}
+	}
+
+	// List cloud projects with aligned formatting
+	for i, project := range m.cloudProjects {
+		selected := "[ ] "
+		for _, idx := range m.selectedCloudIndices {
+			if idx == i {
+				selected = "[✓] "
+				break
+			}
+		}
+
+		projectStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFFFFF"))
+		if strings.Contains(selected, "✓") {
+			projectStyle = projectStyle.Foreground(lipgloss.Color("#00FF00"))
+		}
+
+		line := fmt.Sprintf("%s%d. %-*s", selected, i+1, maxLen, project.Name)
+		s += projectStyle.Render(line) + "\n"
+	}
+
 	// Help text
 	helpText := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#888888")).
-		Render("\n\nPress Enter to start scan | Ctrl+C or Q to quit")
+		Render("\nKeys: 1-9=select  enter=load selected  esc=cancel")
 	s += helpText
+
+	// Display error message if present
+	if m.errorMessage != "" {
+		errorView := errorStyle.Render(fmt.Sprintf("\n⚠ %s", m.errorMessage))
+		s += errorView
+	}
+
+	// Display status message if present
+	if m.statusMessage != "" {
+		statusView := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#00AA00")).
+			Render("\n✓ " + m.statusMessage)
+		s += statusView
+	}
 
 	return docStyle.Render(s)
 }
@@ -729,6 +1063,19 @@ func (m model) viewList() string {
 	}
 
 	view := m.list.View()
+
+	// Add token status indicator
+	var tokenStatus string
+	if token, err := db.GetConfig("github_token"); err != nil || token == "" {
+		tokenStatus = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFAA00")).
+			Render("\n☁ Cloud sync disabled - GitHub token not configured (press 't' to configure)")
+	} else {
+		tokenStatus = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#00AA00")).
+			Render("\n☁ Cloud sync enabled")
+	}
+	view += tokenStatus
 
 	// Display error message if present
 	if m.errorMessage != "" {
@@ -824,9 +1171,18 @@ func (m model) viewList() string {
 	}
 
 	// Add help text
-	helpText := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#888888")).
-		Render("\n\nKeys: enter=open  o=browser  x=run  s=scan  g=clone  c=clear-all  d=archive  r=restore  /=filter  q=quit")
+	var helpText string
+	if token, err := db.GetConfig("github_token"); err != nil || token == "" {
+		// Token not configured
+		helpText = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#888888")).
+			Render("\n\nKeys: enter=open  o=browser  x=run  s=scan  g=clone  t=token  c=clear-all  d=archive  r=restore  /=filter  q=quit")
+	} else {
+		// Token configured
+		helpText = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#888888")).
+			Render("\n\nKeys: enter=open  o=browser  x=run  s=scan  g=clone  u=sync-up  l=select-cloud  t=token  c=clear-all  d=archive  r=restore  /=filter  q=quit")
+	}
 
 	// Build output without extra docStyle wrapping to avoid layout issues
 	return view + scanIndicator + statusView + clonePrompt + archivePrompt + confirmPrompt + helpText
@@ -866,20 +1222,23 @@ func NewModel() (model, error) {
 		}
 
 		return model{
-			screen:          screenSetup,
-			pathInput:       ti,
-			list:            l,
-			errorMessage:    "",
-			statusMessage:   "",
-			isScanning:      false,
-			confirmClearAll: false,
-			confirmArchive:  false,
-			confirmClone:    false,
-			cloneInput:      textinput.New(),
-			rootScanPath:    rootPath,
-			width:           80,
-			height:          24,
-			ready:           false,
+			screen:               screenSetupPath,
+			pathInput:            ti,
+			tokenInput:           textinput.New(),
+			list:                 l,
+			errorMessage:         "",
+			statusMessage:        "",
+			isScanning:           false,
+			confirmClearAll:      false,
+			confirmArchive:       false,
+			confirmClone:         false,
+			cloneInput:           textinput.New(),
+			cloudProjects:        nil,
+			selectedCloudIndices: nil,
+			rootScanPath:         rootPath,
+			width:                80,
+			height:               24,
+			ready:                false,
 		}, nil
 	}
 
@@ -891,20 +1250,23 @@ func NewModel() (model, error) {
 	l.SetItems(items)
 
 	return model{
-		screen:          screenList,
-		pathInput:       textinput.New(),
-		list:            l,
-		errorMessage:    "",
-		statusMessage:   "",
-		isScanning:      false,
-		confirmClearAll: false,
-		confirmArchive:  false,
-		confirmClone:    false,
-		cloneInput:      textinput.New(),
-		rootScanPath:    rootPath,
-		width:           80,
-		height:          24,
-		ready:           false,
+		screen:               screenList,
+		pathInput:            textinput.New(),
+		tokenInput:           textinput.New(),
+		list:                 l,
+		errorMessage:         "",
+		statusMessage:        "",
+		isScanning:           false,
+		confirmClearAll:      false,
+		confirmArchive:       false,
+		confirmClone:         false,
+		cloneInput:           textinput.New(),
+		cloudProjects:        nil,
+		selectedCloudIndices: nil,
+		rootScanPath:         rootPath,
+		width:                80,
+		height:               24,
+		ready:                false,
 	}, nil
 }
 
@@ -1204,5 +1566,158 @@ func cloneProjectCmd(repoURL, rootPath string) tea.Cmd {
 			projectName: repoName,
 			projectPath: projectPath,
 		}
+	}
+}
+
+// syncToCloudCmd creates a command that syncs projects to GitHub Gist
+func syncToCloudCmd() tea.Cmd {
+	return func() tea.Msg {
+		// Get GitHub token from config
+		token, err := db.GetConfig("github_token")
+		if err != nil || token == "" {
+			return SyncToCloudMsg{err: fmt.Errorf("GitHub token not configured. Please set 'github_token' in config")}
+		}
+
+		// Validate token
+		validationClient := engine.NewGistClient(token)
+		if err := validationClient.ValidateToken(); err != nil {
+			return SyncToCloudMsg{err: fmt.Errorf("invalid GitHub token. Please reconfigure your token (press 't')")}
+		}
+
+		// Get existing gist ID from config
+		gistID, _ := db.GetConfig("gist_id")
+
+		// Get all projects
+		projects, err := db.GetProjects()
+		if err != nil {
+			return SyncToCloudMsg{err: fmt.Errorf("failed to get projects: %w", err)}
+		}
+
+		// Create gist client
+		client := engine.NewGistClient(token)
+
+		// Save to gist
+		newGistID, err := client.SaveToGist(projects, gistID)
+		if err != nil {
+			return SyncToCloudMsg{err: err}
+		}
+
+		return SyncToCloudMsg{gistID: newGistID}
+	}
+}
+
+// loadFromCloudCmd creates a command that loads projects from GitHub Gist
+func loadFromCloudCmd() tea.Cmd {
+	return func() tea.Msg {
+		// Get GitHub token from config
+		token, err := db.GetConfig("github_token")
+		if err != nil || token == "" {
+			return LoadFromCloudMsg{err: fmt.Errorf("GitHub token not configured. Please set 'github_token' in config")}
+		}
+
+		// Validate token
+		validationClient := engine.NewGistClient(token)
+		if err := validationClient.ValidateToken(); err != nil {
+			return LoadFromCloudMsg{err: fmt.Errorf("invalid GitHub token. Please reconfigure your token (press 't')")}
+		}
+
+		// Get gist ID from config
+		gistID, err := db.GetConfig("gist_id")
+		if err != nil || gistID == "" {
+			return LoadFromCloudMsg{err: fmt.Errorf("gist ID not configured. Please sync to cloud first")}
+		}
+
+		// Create gist client
+		client := engine.NewGistClient(token)
+
+		// Load from gist
+		projects, err := client.LoadFromGist(gistID)
+		if err != nil {
+			return LoadFromCloudMsg{err: err}
+		}
+
+		// Clear existing projects
+		if _, err := db.DeleteAllProjects(); err != nil {
+			return LoadFromCloudMsg{err: fmt.Errorf("failed to clear existing projects: %w", err)}
+		}
+
+		// Add loaded projects
+		for _, project := range projects {
+			project.ID = 0 // Reset ID for new insertion
+			if err := db.AddProject(&project); err != nil {
+				return LoadFromCloudMsg{err: fmt.Errorf("failed to add project %s: %w", project.Name, err)}
+			}
+		}
+
+		return LoadFromCloudMsg{projectsLoaded: len(projects)}
+	}
+}
+
+// listCloudProjectsCmd creates a command that lists projects from GitHub Gist
+func listCloudProjectsCmd() tea.Cmd {
+	return func() tea.Msg {
+		// Get GitHub token from config
+		token, err := db.GetConfig("github_token")
+		if err != nil || token == "" {
+			return ListCloudProjectsMsg{err: fmt.Errorf("GitHub token not configured")}
+		}
+
+		// Validate token
+		validationClient := engine.NewGistClient(token)
+		if err := validationClient.ValidateToken(); err != nil {
+			return ListCloudProjectsMsg{err: fmt.Errorf("invalid GitHub token")}
+		}
+
+		// Get gist ID from config
+		gistID, err := db.GetConfig("gist_id")
+		if err != nil || gistID == "" {
+			return ListCloudProjectsMsg{err: fmt.Errorf("no cloud backup found. Please sync to cloud first")}
+		}
+
+		// Create gist client
+		client := engine.NewGistClient(token)
+
+		// Load projects from gist
+		projects, err := client.ListProjectsFromGist(gistID)
+		if err != nil {
+			return ListCloudProjectsMsg{err: err}
+		}
+
+		return ListCloudProjectsMsg{projects: projects}
+	}
+}
+
+// loadSelectedProjectsCmd creates a command that loads selected projects from cloud
+func loadSelectedProjectsCmd(selectedIndices []int, cloudProjects []models.Project) tea.Cmd {
+	return func() tea.Msg {
+		loadedCount := 0
+
+		for _, idx := range selectedIndices {
+			if idx < 0 || idx >= len(cloudProjects) {
+				continue
+			}
+
+			project := cloudProjects[idx]
+			// Reset ID for new insertion and mark as archived
+			project.ID = 0
+			project.Status = "archived"
+
+			// Check if project already exists
+			if existing, err := db.GetProjectByPath(project.Path); err == nil {
+				// Update existing project
+				project.ID = existing.ID
+				if err := db.UpdateProject(&project); err != nil {
+					continue
+				}
+			} else {
+				// Add new project
+				if err := db.AddProject(&project); err != nil {
+					continue
+				}
+			}
+			loadedCount++
+		}
+
+		return LoadSelectedProjectsMsg{projectsLoaded: loadedCount}
 	}
 }
