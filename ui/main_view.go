@@ -72,21 +72,37 @@ func (i projectItem) FilterValue() string {
 
 // Title implements list.DefaultItem
 func (i projectItem) Title() string {
+	title := i.project.Name
+
+	// Add GitHub indicator
+	if i.project.RepoURL != "" {
+		title = "🔗 " + title
+	}
+
 	if i.isLoading {
-		return i.project.Name + " [Processing...]"
+		return title + " [Processing...]"
 	}
 	if i.project.Status == "archived" {
-		return i.project.Name + " [Archived]"
+		return title + " [Archived]"
 	}
-	return i.project.Name
+	return title
 }
 
 // Description implements list.DefaultItem
 func (i projectItem) Description() string {
+	desc := ""
 	if i.project.Path != "" {
-		return i.project.Path
+		desc = i.project.Path
+	} else {
+		desc = i.project.Status
 	}
-	return i.project.Status
+
+	// Add repo URL info if available
+	if i.project.RepoURL != "" {
+		desc += " • " + i.project.RepoURL
+	}
+
+	return desc
 }
 
 var docStyle = lipgloss.NewStyle().Margin(1, 2)

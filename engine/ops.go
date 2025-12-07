@@ -3,6 +3,7 @@ package engine
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 
 	"github.com/go-git/go-git/v5"
@@ -66,14 +67,12 @@ func RestoreProject(projectID uint) error {
 		return fmt.Errorf("failed to create parent directory: %w", err)
 	}
 
-	// Clone the repository with shallow cloning (Depth: 1)
-	// CRITICAL OPTIMIZATION: Only download the latest commit to save bandwidth and time
-	cloneOptions := &git.CloneOptions{
-		URL:   project.RepoURL,
-		Depth: 1, // Shallow clone - only the latest commit
-	}
+	// For private repositories, we need to use system git with credential helper
+	// The go-git library doesn't easily integrate with Windows Credential Manager
+	// So we'll fall back to using system git command for authentication
 
-	_, err = git.PlainClone(project.Path, false, cloneOptions)
+	// Try using system git command which has credential helper configured
+	err = cloneWithSystemGit(project.RepoURL, project.Path)
 	if err != nil {
 		// Clean up the directory if clone fails
 		_ = os.RemoveAll(project.Path)
@@ -229,4 +228,19 @@ func RestoreWithVerification(projectID uint) error {
 
 	// Proceed with restoration
 	return RestoreProject(projectID)
+}
+
+// cloneWithSystemGit uses the system's git command to clone a repository
+// This allows using the system's credential helper (Windows Credential Manager, etc.)
+func cloneWithSystemGit(repoURL, destPath string) error {
+	// Use git clone with depth 1 for faster cloning
+	cmd := exec.Command("git", "clone", "--depth", "1", repoURL, destPath)
+
+	// Capture output for better error messages
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, string(output))
+	}
+
+	return nil
 }
