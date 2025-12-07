@@ -48,9 +48,10 @@ type OpenProjectMsg struct {
 
 // ScanCompleteMsg is sent when directory scan completes
 type ScanCompleteMsg struct {
-	projectsFound int
-	projectsAdded int
-	err           error
+	projectsFound   int
+	projectsAdded   int
+	projectsRemoved int
+	err             error
 }
 
 // ClearAllMsg is sent when clearing all projects completes
@@ -139,6 +140,7 @@ type model struct {
 	archiveConfirmInput textinput.Model
 	archiveProject      *projectItem
 	archiveIdx          int
+	rootScanPath        string
 	width               int
 	height              int
 	ready               bool
@@ -317,10 +319,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.isScanning {
 				return m, nil // Already scanning
 			}
+			if m.rootScanPath == "" {
+				m.errorMessage = "No scan path configured. Please restart."
+				return m, nil
+			}
 			m.isScanning = true
 			m.statusMessage = "Scanning for projects..."
 			m.errorMessage = ""
-			return m, scanProjectsCmd()
+			return m, scanProjectsWithPathCmd(m.rootScanPath)
 
 		case "c":
 			// Clear all projects - ask for confirmation
@@ -388,7 +394,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.errorMessage = fmt.Sprintf("Scan failed: %v", msg.err)
 			m.statusMessage = ""
 		} else {
-			m.statusMessage = fmt.Sprintf("Scan complete: Found %d projects, added %d new", msg.projectsFound, msg.projectsAdded)
+			if msg.projectsRemoved > 0 {
+				m.statusMessage = fmt.Sprintf("Scan complete: Found %d, added %d new, removed %d", msg.projectsFound, msg.projectsAdded, msg.projectsRemoved)
+			} else {
+				m.statusMessage = fmt.Sprintf("Scan complete: Found %d projects, added %d new", msg.projectsFound, msg.projectsAdded)
+			}
 			m.errorMessage = ""
 			// Switch to list view if we're on setup screen
 			if m.screen == screenSetup {
@@ -449,6 +459,9 @@ func (m model) updateSetup(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.isScanning = true
 			m.statusMessage = "Scanning for projects..."
 			m.errorMessage = ""
+			m.rootScanPath = m.pathInput.Value()
+			// Save root path to config
+			_ = db.SetConfig("root_scan_path", m.pathInput.Value())
 			return m, scanProjectsWithPathCmd(m.pathInput.Value())
 		}
 
@@ -648,6 +661,9 @@ func NewModel() (model, error) {
 		return model{}, fmt.Errorf("failed to load projects: %w", err)
 	}
 
+	// Load root scan path from config
+	rootPath, _ := db.GetConfig("root_scan_path")
+
 	// Create the list with reasonable default dimensions
 	delegate := list.NewDefaultDelegate()
 	l := list.New([]list.Item{}, delegate, 80, 20)
@@ -677,6 +693,7 @@ func NewModel() (model, error) {
 			errorMessage:  "",
 			statusMessage: "",
 			isScanning:    false,
+			rootScanPath:  rootPath,
 			width:         80,
 			height:        24,
 			ready:         false,
@@ -697,6 +714,7 @@ func NewModel() (model, error) {
 		errorMessage:  "",
 		statusMessage: "",
 		isScanning:    false,
+		rootScanPath:  rootPath,
 		width:         80,
 		height:        24,
 		ready:         false,
@@ -742,36 +760,6 @@ func openProjectCmd(projectID uint, path string) tea.Cmd {
 	}
 }
 
-// scanProjectsCmd creates a command that scans for projects
-func scanProjectsCmd() tea.Cmd {
-	return func() tea.Msg {
-		// Get user home directory or use current directory
-		scanPath := "."
-		if homeDir, err := os.UserHomeDir(); err == nil {
-			scanPath = homeDir
-		}
-
-		// Scan for projects
-		projects, err := engine.ScanDirectory(scanPath)
-		if err != nil {
-			return ScanCompleteMsg{err: err}
-		}
-
-		// Add projects to database
-		addedCount := 0
-		for i := range projects {
-			if err := db.AddProject(&projects[i]); err == nil {
-				addedCount++
-			}
-		}
-
-		return ScanCompleteMsg{
-			projectsFound: len(projects),
-			projectsAdded: addedCount,
-		}
-	}
-}
-
 // scanProjectsWithPathCmd creates a command that scans for projects at a specific path
 func scanProjectsWithPathCmd(scanPath string) tea.Cmd {
 	return func() tea.Msg {
@@ -781,7 +769,29 @@ func scanProjectsWithPathCmd(scanPath string) tea.Cmd {
 			return ScanCompleteMsg{err: err}
 		}
 
-		// Add projects to database
+		// Get existing projects from database
+		existingProjects, err := db.GetProjects()
+		if err != nil {
+			return ScanCompleteMsg{err: err}
+		}
+
+		// Create map of scanned project paths
+		scannedPaths := make(map[string]bool)
+		for _, p := range projects {
+			scannedPaths[p.Path] = true
+		}
+
+		// Remove projects that no longer exist (only active ones)
+		removedCount := 0
+		for _, existing := range existingProjects {
+			if existing.Status == "active" && !scannedPaths[existing.Path] {
+				if err := db.DeleteProject(existing.ID); err == nil {
+					removedCount++
+				}
+			}
+		}
+
+		// Add new projects to database
 		addedCount := 0
 		for i := range projects {
 			if err := db.AddProject(&projects[i]); err == nil {
@@ -790,8 +800,9 @@ func scanProjectsWithPathCmd(scanPath string) tea.Cmd {
 		}
 
 		return ScanCompleteMsg{
-			projectsFound: len(projects),
-			projectsAdded: addedCount,
+			projectsFound:   len(projects),
+			projectsAdded:   addedCount,
+			projectsRemoved: removedCount,
 		}
 	}
 }

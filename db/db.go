@@ -60,7 +60,7 @@ func InitDB(dbPath string) error {
 	sqlDB.SetConnMaxLifetime(time.Hour)
 
 	// Auto-migrate the schema
-	if err := DB.AutoMigrate(&models.Project{}); err != nil {
+	if err := DB.AutoMigrate(&models.Project{}, &models.Config{}); err != nil {
 		return fmt.Errorf("failed to migrate database: %w", err)
 	}
 
@@ -174,4 +174,30 @@ func CloseDB() error {
 		return fmt.Errorf("failed to get database instance: %w", err)
 	}
 	return sqlDB.Close()
+}
+
+// GetConfig retrieves a configuration value by key
+func GetConfig(key string) (string, error) {
+	var config models.Config
+	result := DB.Where("key = ?", key).First(&config)
+	if result.Error != nil {
+		return "", result.Error
+	}
+	return config.Value, nil
+}
+
+// SetConfig sets a configuration value
+func SetConfig(key, value string) error {
+	var config models.Config
+	result := DB.Where("key = ?", key).First(&config)
+
+	if result.Error == nil {
+		// Update existing
+		config.Value = value
+		return DB.Save(&config).Error
+	}
+
+	// Create new
+	config = models.Config{Key: key, Value: value}
+	return DB.Create(&config).Error
 }

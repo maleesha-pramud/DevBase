@@ -6,6 +6,13 @@ import (
 	"gorm.io/gorm"
 )
 
+// Config represents application configuration
+type Config struct {
+	ID    uint   `gorm:"primaryKey" json:"id"`
+	Key   string `gorm:"unique;not null" json:"key"`
+	Value string `json:"value"`
+}
+
 // Project represents a development project in the database
 type Project struct {
 	ID         uint           `gorm:"primaryKey" json:"id"`
