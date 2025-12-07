@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -127,6 +129,13 @@ const (
 	screenList
 )
 
+// CloneMsg is sent when a clone operation completes
+type CloneMsg struct {
+	projectName string
+	projectPath string
+	err         error
+}
+
 // model represents the Bubble Tea application model
 type model struct {
 	screen              screenState
@@ -140,6 +149,8 @@ type model struct {
 	archiveConfirmInput textinput.Model
 	archiveProject      *projectItem
 	archiveIdx          int
+	confirmClone        bool
+	cloneInput          textinput.Model
 	rootScanPath        string
 	width               int
 	height              int
@@ -178,6 +189,36 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Handle list screen
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		// If in clone input mode, only handle enter and esc
+		if m.confirmClone {
+			switch msg.String() {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "enter":
+				repoURL := m.cloneInput.Value()
+				if repoURL == "" {
+					m.errorMessage = "Please enter a valid GitHub repository URL"
+					return m, nil
+				}
+				// Clear confirmation state
+				m.confirmClone = false
+				m.statusMessage = "Cloning repository..."
+				m.errorMessage = ""
+				// Execute clone
+				return m, cloneProjectCmd(repoURL, m.rootScanPath)
+			case "esc":
+				m.confirmClone = false
+				m.statusMessage = "Clone cancelled"
+				m.errorMessage = ""
+				return m, nil
+			default:
+				// Pass other keys to the text input
+				var cmd tea.Cmd
+				m.cloneInput, cmd = m.cloneInput.Update(msg)
+				return m, cmd
+			}
+		}
+
 		// If in archive confirmation mode, only handle enter and esc
 		if m.confirmArchive {
 			switch msg.String() {
@@ -326,6 +367,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.errorMessage = ""
 			return m, scanProjectsWithPathCmd(m.rootScanPath)
 
+		case "g":
+			// Clone a GitHub repository
+			if m.confirmClone {
+				return m, nil // Already in clone mode
+			}
+			if m.rootScanPath == "" {
+				m.errorMessage = "No scan path configured. Please restart."
+				return m, nil
+			}
+			// Enter clone mode
+			m.confirmClone = true
+			m.errorMessage = ""
+			m.statusMessage = ""
+
+			// Create clone input
+			cloneInput := textinput.New()
+			cloneInput.Placeholder = "https://github.com/owner/repo"
+			cloneInput.Focus()
+			cloneInput.CharLimit = 256
+			cloneInput.Width = 60
+			m.cloneInput = cloneInput
+
+			return m, textinput.Blink
+
 		case "c":
 			// Clear all projects - ask for confirmation
 			if !m.confirmClearAll {
@@ -375,6 +440,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusMessage = "Project restored successfully"
 			return m, reloadProjectsCmd()
 		}
+
+	case CloneMsg:
+		// Handle clone completion
+		if msg.err != nil {
+			m.errorMessage = fmt.Sprintf("Clone failed: %v", msg.err)
+			m.statusMessage = ""
+		} else {
+			m.errorMessage = ""
+			m.statusMessage = fmt.Sprintf("Successfully cloned %s", msg.projectName)
+			// Reload the list to show the new project
+			return m, reloadProjectsCmd()
+		}
+		return m, nil
 
 	case OpenProjectMsg:
 		// Handle VS Code open completion
@@ -602,6 +680,23 @@ func (m model) viewList() string {
 			Render("\n\n✓ " + m.statusMessage)
 	}
 
+	// Add clone input dialog if in clone mode
+	clonePrompt := ""
+	if m.confirmClone {
+		clonePrompt = "\n\n" +
+			lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#00FFFF")).
+				Bold(true).
+				Render("🔗 CLONE GITHUB REPOSITORY") + "\n\n" +
+			lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#FFFFFF")).
+				Render("Enter GitHub repository URL:") + "\n" +
+			m.cloneInput.View() + "\n\n" +
+			lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#888888")).
+				Render("Press Enter to clone | ESC to cancel")
+	}
+
 	// Add archive confirmation dialog if in archive mode
 	archivePrompt := ""
 	if m.confirmArchive && m.archiveProject != nil {
@@ -658,10 +753,10 @@ func (m model) viewList() string {
 	// Add help text
 	helpText := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#888888")).
-		Render("\n\nKeys: enter=open  s=scan  c=clear-all  d=archive  r=restore  /=filter  q=quit")
+		Render("\n\nKeys: enter=open  s=scan  g=clone  c=clear-all  d=archive  r=restore  /=filter  q=quit")
 
 	// Build output without extra docStyle wrapping to avoid layout issues
-	return view + scanIndicator + statusView + archivePrompt + confirmPrompt + helpText
+	return view + scanIndicator + statusView + clonePrompt + archivePrompt + confirmPrompt + helpText
 }
 
 // NewModel creates a new model with projects loaded from the database
@@ -698,16 +793,20 @@ func NewModel() (model, error) {
 		}
 
 		return model{
-			screen:        screenSetup,
-			pathInput:     ti,
-			list:          l,
-			errorMessage:  "",
-			statusMessage: "",
-			isScanning:    false,
-			rootScanPath:  rootPath,
-			width:         80,
-			height:        24,
-			ready:         false,
+			screen:          screenSetup,
+			pathInput:       ti,
+			list:            l,
+			errorMessage:    "",
+			statusMessage:   "",
+			isScanning:      false,
+			confirmClearAll: false,
+			confirmArchive:  false,
+			confirmClone:    false,
+			cloneInput:      textinput.New(),
+			rootScanPath:    rootPath,
+			width:           80,
+			height:          24,
+			ready:           false,
 		}, nil
 	}
 
@@ -719,16 +818,20 @@ func NewModel() (model, error) {
 	l.SetItems(items)
 
 	return model{
-		screen:        screenList,
-		pathInput:     textinput.New(),
-		list:          l,
-		errorMessage:  "",
-		statusMessage: "",
-		isScanning:    false,
-		rootScanPath:  rootPath,
-		width:         80,
-		height:        24,
-		ready:         false,
+		screen:          screenList,
+		pathInput:       textinput.New(),
+		list:            l,
+		errorMessage:    "",
+		statusMessage:   "",
+		isScanning:      false,
+		confirmClearAll: false,
+		confirmArchive:  false,
+		confirmClone:    false,
+		cloneInput:      textinput.New(),
+		rootScanPath:    rootPath,
+		width:           80,
+		height:          24,
+		ready:           false,
 	}, nil
 }
 
@@ -848,6 +951,54 @@ func clearAllProjectsCmd() tea.Cmd {
 		return ClearAllMsg{
 			count: count,
 			err:   err,
+		}
+	}
+}
+
+// cloneProjectCmd creates a command that clones a GitHub repository and adds it to the database
+func cloneProjectCmd(repoURL, rootPath string) tea.Cmd {
+	return func() tea.Msg {
+		// Parse repo name from URL
+		// Expected format: https://github.com/owner/repo or https://github.com/owner/repo.git
+		parts := strings.Split(repoURL, "/")
+		if len(parts) < 2 {
+			return CloneMsg{err: fmt.Errorf("invalid GitHub URL format")}
+		}
+		repoName := parts[len(parts)-1]
+		// Remove .git suffix if present
+		repoName = strings.TrimSuffix(repoName, ".git")
+
+		// Determine project path
+		projectPath := filepath.Join(rootPath, repoName)
+
+		// Check if project already exists
+		if _, err := db.GetProjectByPath(projectPath); err == nil {
+			return CloneMsg{err: fmt.Errorf("project already exists at %s", projectPath)}
+		}
+
+		// Clone the repository
+		if err := engine.CloneRepository(repoURL, projectPath); err != nil {
+			return CloneMsg{err: err}
+		}
+
+		// Create project record
+		project := &models.Project{
+			Name:    repoName,
+			Path:    projectPath,
+			RepoURL: repoURL,
+			Status:  "active",
+		}
+
+		// Add to database
+		if err := db.AddProject(project); err != nil {
+			// Clean up cloned directory on failure
+			os.RemoveAll(projectPath)
+			return CloneMsg{err: err}
+		}
+
+		return CloneMsg{
+			projectName: repoName,
+			projectPath: projectPath,
 		}
 	}
 }

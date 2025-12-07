@@ -230,6 +230,25 @@ func RestoreWithVerification(projectID uint) error {
 	return RestoreProject(projectID)
 }
 
+// CloneRepository clones a git repository to the specified destination path
+func CloneRepository(repoURL, destPath string) error {
+	// Ensure the directory does not currently exist
+	if _, err := os.Stat(destPath); err == nil {
+		return fmt.Errorf("destination path already exists: %s", destPath)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("failed to check destination path: %w", err)
+	}
+
+	// Create the parent directory if it doesn't exist
+	parentDir := filepath.Dir(destPath)
+	if err := os.MkdirAll(parentDir, 0755); err != nil {
+		return fmt.Errorf("failed to create parent directory: %w", err)
+	}
+
+	// Clone using system git
+	return cloneWithSystemGit(repoURL, destPath)
+}
+
 // cloneWithSystemGit uses the system's git command to clone a repository
 // This allows using the system's credential helper (Windows Credential Manager, etc.)
 func cloneWithSystemGit(repoURL, destPath string) error {
