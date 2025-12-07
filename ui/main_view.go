@@ -286,10 +286,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			originalItem := item
 			originalIdx := m.list.Index()
 
-			// OPTIMISTIC: Immediately show loading state
-			item.isLoading = true
-			m.list.SetItem(originalIdx, item)
 			m.errorMessage = "" // Clear any previous errors
+			m.statusMessage = "Restoring project..."
 
 			// Return command to restore in background
 			return m, restoreProjectCmd(item.project.ID, originalItem, originalIdx)
@@ -356,11 +354,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// ROLLBACK: Archive failed, revert the change
 			m.list.SetItem(msg.originalIdx, msg.originalItem)
 			m.errorMessage = fmt.Sprintf("Archive failed: %v", msg.err)
+			return m, nil
 		} else {
-			// Success: UI is already updated optimistically
+			// Success: Reload list from database to fix filtering and prevent duplicates
 			m.errorMessage = ""
+			m.statusMessage = "Project archived successfully"
+			return m, reloadProjectsCmd()
 		}
-		return m, nil
 
 	case RestoreMsg:
 		// Handle restore completion
@@ -368,15 +368,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// ROLLBACK: Restore failed, revert the change
 			m.list.SetItem(msg.originalIdx, msg.originalItem)
 			m.errorMessage = fmt.Sprintf("Restore failed: %v", msg.err)
+			return m, nil
 		} else {
-			// SUCCESS: Update to active status (restore completed)
-			item := m.list.Items()[msg.originalIdx].(projectItem)
-			item.project.Status = "active"
-			item.isLoading = false
-			m.list.SetItem(msg.originalIdx, item)
+			// SUCCESS: Reload list from database to fix filtering and prevent duplicates
 			m.errorMessage = ""
+			m.statusMessage = "Project restored successfully"
+			return m, reloadProjectsCmd()
 		}
-		return m, nil
 
 	case OpenProjectMsg:
 		// Handle VS Code open completion
