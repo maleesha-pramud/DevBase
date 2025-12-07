@@ -421,10 +421,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.list.SetItems([]list.Item{})
 			// Switch to setup screen
 			m.screen = screenSetup
-			// Reset path input
-			if homeDir, err := os.UserHomeDir(); err == nil {
-				m.pathInput.SetValue(homeDir)
+
+			// Create and focus new path input
+			ti := textinput.New()
+			ti.Placeholder = "Enter path (e.g., D:\\\\Projects)"
+			ti.Focus()
+			ti.CharLimit = 256
+			ti.Width = 60
+
+			// Reset path input with stored or home directory
+			if m.rootScanPath != "" {
+				ti.SetValue(m.rootScanPath)
+			} else if homeDir, err := os.UserHomeDir(); err == nil {
+				ti.SetValue(homeDir)
 			}
+
+			m.pathInput = ti
+			return m, textinput.Blink
 		}
 		return m, nil
 
