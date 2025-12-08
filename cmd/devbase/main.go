@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -29,8 +30,14 @@ func main() {
 		}
 	}
 
-	// Initialize the database
-	if err := db.InitDB("devbase.db"); err != nil {
+	// Initialize the database with proper path
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		log.Fatalf("Failed to get user home directory: %v", err)
+	}
+	dbPath := filepath.Join(homeDir, "devbase.db")
+
+	if err := db.InitDB(dbPath); err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
 	defer db.CloseDB()

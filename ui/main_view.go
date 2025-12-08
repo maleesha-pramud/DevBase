@@ -781,7 +781,11 @@ func (m model) updateSetup(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 
 				// Validate token before saving
-				validationClient := engine.NewGistClient(token)
+				validationClient, err := engine.NewGistClient(token)
+				if err != nil {
+					m.errorMessage = "Failed to create validation client."
+					return m, nil
+				}
 				if err := validationClient.ValidateToken(); err != nil {
 					m.errorMessage = "Invalid GitHub token. Please check your token and try again."
 					return m, nil
@@ -2198,14 +2202,16 @@ func syncToCloudCmd() tea.Cmd {
 			return SyncToCloudMsg{err: fmt.Errorf("GitHub authentication required. Please authenticate with OAuth (press 't')")}
 		}
 
-		// Validate token
-		validationClient := engine.NewGistClient(token)
-		if err := validationClient.ValidateToken(); err != nil {
-			return SyncToCloudMsg{err: fmt.Errorf("invalid GitHub token. Please reconfigure your token (press 't')")}
+		// Create gist client (loads existing gist ID automatically)
+		client, err := engine.NewGistClient(token)
+		if err != nil {
+			return SyncToCloudMsg{err: fmt.Errorf("failed to create gist client: %w", err)}
 		}
 
-		// Get existing gist ID from config
-		gistID, _ := db.GetConfig("gist_id")
+		// Validate token
+		if err := client.ValidateToken(); err != nil {
+			return SyncToCloudMsg{err: fmt.Errorf("invalid GitHub token. Please reconfigure your token (press 't')")}
+		}
 
 		// Get all projects
 		projects, err := db.GetProjects()
@@ -2213,16 +2219,13 @@ func syncToCloudCmd() tea.Cmd {
 			return SyncToCloudMsg{err: fmt.Errorf("failed to get projects: %w", err)}
 		}
 
-		// Create gist client
-		client := engine.NewGistClient(token)
-
-		// Save to gist
-		newGistID, err := client.SaveToGist(projects, gistID)
+		// Save to gist (creates new or updates existing)
+		err = client.SaveToGist(projects)
 		if err != nil {
 			return SyncToCloudMsg{err: err}
 		}
 
-		return SyncToCloudMsg{gistID: newGistID}
+		return SyncToCloudMsg{gistID: client.GistID}
 	}
 }
 
@@ -2235,23 +2238,19 @@ func loadFromCloudCmd() tea.Cmd {
 			return LoadFromCloudMsg{err: fmt.Errorf("GitHub authentication required. Please authenticate with OAuth (press 't')")}
 		}
 
+		// Create gist client (loads existing gist ID automatically)
+		client, err := engine.NewGistClient(token)
+		if err != nil {
+			return LoadFromCloudMsg{err: fmt.Errorf("failed to create gist client: %w", err)}
+		}
+
 		// Validate token
-		validationClient := engine.NewGistClient(token)
-		if err := validationClient.ValidateToken(); err != nil {
+		if err := client.ValidateToken(); err != nil {
 			return LoadFromCloudMsg{err: fmt.Errorf("invalid GitHub token. Please reconfigure your token (press 't')")}
 		}
 
-		// Get gist ID from config
-		gistID, err := db.GetConfig("gist_id")
-		if err != nil || gistID == "" {
-			return LoadFromCloudMsg{err: fmt.Errorf("gist ID not configured. Please sync to cloud first")}
-		}
-
-		// Create gist client
-		client := engine.NewGistClient(token)
-
-		// Load from gist
-		projects, err := client.LoadFromGist(gistID)
+		// Load from gist (uses internal gist ID)
+		projects, err := client.LoadFromGist()
 		if err != nil {
 			return LoadFromCloudMsg{err: err}
 		}
@@ -2282,23 +2281,19 @@ func listCloudProjectsCmd() tea.Cmd {
 			return ListCloudProjectsMsg{err: fmt.Errorf("GitHub authentication required. Please authenticate with OAuth (press 't')")}
 		}
 
+		// Create gist client (loads existing gist ID automatically)
+		client, err := engine.NewGistClient(token)
+		if err != nil {
+			return ListCloudProjectsMsg{err: fmt.Errorf("failed to create gist client: %w", err)}
+		}
+
 		// Validate token
-		validationClient := engine.NewGistClient(token)
-		if err := validationClient.ValidateToken(); err != nil {
+		if err := client.ValidateToken(); err != nil {
 			return ListCloudProjectsMsg{err: fmt.Errorf("invalid GitHub token")}
 		}
 
-		// Get gist ID from config
-		gistID, err := db.GetConfig("gist_id")
-		if err != nil || gistID == "" {
-			return ListCloudProjectsMsg{err: fmt.Errorf("no cloud backup found. Please sync to cloud first")}
-		}
-
-		// Create gist client
-		client := engine.NewGistClient(token)
-
-		// Load projects from gist
-		projects, err := client.ListProjectsFromGist(gistID)
+		// Load projects from gist (uses internal gist ID)
+		projects, err := client.ListProjectsFromGist()
 		if err != nil {
 			return ListCloudProjectsMsg{err: err}
 		}

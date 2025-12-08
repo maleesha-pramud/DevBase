@@ -31,6 +31,8 @@ go install ./cmd/devbase
 ### Option 3: Use Pre-built Binary
 Download `DevBase.exe` and place it in your PATH.
 
+**Note:** DevBase stores its database file (`devbase.db`) in your home directory (`~/devbase.db` on Unix-like systems, `%USERPROFILE%\devbase.db` on Windows). This allows you to run the `devbase` command from any directory.
+
 ## 🎮 Usage
 
 ### Interactive Mode (Default)
