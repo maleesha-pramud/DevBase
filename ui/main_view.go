@@ -98,6 +98,21 @@ type LoadSelectedProjectsMsg struct {
 	err            error
 }
 
+// OAuthDeviceCodeMsg is sent when device code is obtained from GitHub
+type OAuthDeviceCodeMsg struct {
+	deviceCode      string
+	userCode        string
+	verificationURI string
+	interval        int
+	err             error
+}
+
+// OAuthCompleteMsg is sent when OAuth authentication completes
+type OAuthCompleteMsg struct {
+	accessToken string
+	err         error
+}
+
 // projectItem wraps a Project and implements the list.Item interface
 type projectItem struct {
 	project   models.Project
@@ -162,7 +177,9 @@ type screenState int
 
 const (
 	screenSetupPath screenState = iota
+	screenSetupGitHub
 	screenSetupToken
+	screenOAuthWaiting
 	screenCloudSelect
 	screenList
 )
@@ -192,10 +209,18 @@ type model struct {
 	cloneInput           textinput.Model
 	cloudProjects        []models.Project
 	selectedCloudIndices []int
+	cloudCursorIndex     int
+	cloudFilterInput     textinput.Model
+	cloudFiltering       bool
 	rootScanPath         string
 	width                int
 	height               int
 	ready                bool
+	// OAuth flow fields
+	oauthDeviceCode      string
+	oauthUserCode        string
+	oauthVerificationURI string
+	oauthInterval        int
 }
 
 // Init initializes the model and loads projects from the database
@@ -223,7 +248,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	// Handle setup screen
-	if m.screen == screenSetupPath || m.screen == screenSetupToken {
+	if m.screen == screenSetupPath || m.screen == screenSetupGitHub || m.screen == screenOAuthWaiting {
 		return m.updateSetup(msg)
 	}
 
@@ -494,7 +519,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "u":
 			// Check if GitHub token is configured
 			if token, err := db.GetConfig("github_token"); err != nil || token == "" {
-				m.errorMessage = "GitHub token not configured. Press 't' to configure token."
+				m.errorMessage = "GitHub authentication required. Press 't' to authenticate with OAuth."
 				return m, nil
 			}
 			// Sync to cloud (upload projects to GitHub Gist)
@@ -505,7 +530,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "l":
 			// Check if GitHub token is configured
 			if token, err := db.GetConfig("github_token"); err != nil || token == "" {
-				m.errorMessage = "GitHub token not configured. Press 't' to configure token."
+				m.errorMessage = "GitHub authentication required. Press 't' to authenticate with OAuth."
 				return m, nil
 			}
 			// List projects from cloud
@@ -514,18 +539,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, listCloudProjectsCmd()
 
 		case "t":
-			// Configure GitHub token
-			m.screen = screenSetupToken
-			// Initialize token input
-			ti := textinput.New()
-			ti.Placeholder = "Enter GitHub Personal Access Token"
-			ti.Focus()
-			ti.CharLimit = 256
-			ti.Width = 60
-			m.tokenInput = ti
+			// Configure GitHub OAuth
+			m.screen = screenSetupGitHub
 			m.errorMessage = ""
 			m.statusMessage = ""
-			return m, textinput.Blink
+			return m, nil
 
 		case "esc":
 			// Cancel clear all confirmation
@@ -620,7 +638,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.errorMessage = ""
 			// Switch to list view if we're on setup screen
-			if m.screen == screenSetupPath || m.screen == screenSetupToken {
+			if m.screen == screenSetupPath || m.screen == screenSetupGitHub {
 				m.screen = screenList
 			}
 			// Reload the list
@@ -700,6 +718,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.cloudProjects = msg.projects
 		m.selectedCloudIndices = []int{}
+		m.cloudCursorIndex = 0 // Initialize cursor at first item
 		m.screen = screenCloudSelect
 		m.statusMessage = ""
 		m.errorMessage = ""
@@ -748,12 +767,16 @@ func (m model) updateSetup(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Save root path to config
 				_ = db.SetConfig("root_scan_path", m.pathInput.Value())
 				return m, scanProjectsWithPathCmd(m.pathInput.Value())
+			} else if m.screen == screenSetupGitHub {
+				// User pressed enter to start OAuth flow
+				m.statusMessage = "Initiating GitHub authentication..."
+				m.errorMessage = ""
+				return m, initiateOAuthCmd()
 			} else if m.screen == screenSetupToken {
 				// Handle token input
 				token := m.tokenInput.Value()
 				if token == "" {
-					// Skip token setup if empty
-					m.screen = screenList
+					m.errorMessage = "Please enter a valid GitHub token"
 					return m, nil
 				}
 
@@ -769,7 +792,7 @@ func (m model) updateSetup(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.statusMessage = "GitHub token configured successfully"
 				m.errorMessage = ""
 				m.screen = screenList
-				return m, nil
+				return m, reloadProjectsCmd()
 			}
 		default:
 			// For any other key, pass it to the appropriate text input
@@ -777,7 +800,35 @@ func (m model) updateSetup(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.screen == screenSetupPath {
 				m.pathInput, cmd = m.pathInput.Update(msg)
 			} else if m.screen == screenSetupToken {
+				if msg.String() == "esc" {
+					// Go back to GitHub setup screen
+					m.screen = screenSetupGitHub
+					m.errorMessage = ""
+					m.statusMessage = ""
+					return m, nil
+				}
 				m.tokenInput, cmd = m.tokenInput.Update(msg)
+			} else if m.screen == screenSetupGitHub {
+				// On GitHub setup screen, handle skip or PAT option
+				if msg.String() == "s" {
+					// Skip OAuth setup
+					m.screen = screenList
+					m.statusMessage = "Skipped GitHub authentication. You can configure it later with 't'."
+					return m, reloadProjectsCmd()
+				} else if msg.String() == "p" {
+					// Switch to manual token entry
+					m.screen = screenSetupToken
+					m.errorMessage = ""
+					m.statusMessage = ""
+					// Initialize token input
+					ti := textinput.New()
+					ti.Placeholder = "ghp_xxxxxxxxxxxxxxxxxxxx"
+					ti.Focus()
+					ti.CharLimit = 256
+					ti.Width = 60
+					m.tokenInput = ti
+					return m, textinput.Blink
+				}
 			}
 			return m, cmd
 		}
@@ -791,16 +842,59 @@ func (m model) updateSetup(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.statusMessage = fmt.Sprintf("Found %d projects, added %d to database", msg.projectsFound, msg.projectsAdded)
-		// Switch to token setup screen
-		m.screen = screenSetupToken
-		// Initialize token input
-		ti := textinput.New()
-		ti.Placeholder = "Enter GitHub Personal Access Token (optional)"
-		ti.Focus()
-		ti.CharLimit = 256
-		ti.Width = 60
-		m.tokenInput = ti
-		return m, textinput.Blink
+		// Switch to GitHub setup screen
+		m.screen = screenSetupGitHub
+		m.errorMessage = ""
+		return m, nil
+
+	case OAuthDeviceCodeMsg:
+		// Handle device code response
+		if msg.err != nil {
+			m.errorMessage = fmt.Sprintf("OAuth initiation failed: %v", msg.err)
+			m.statusMessage = "Falling back to manual token entry..."
+			// Automatically switch to manual token entry after a short delay
+			m.screen = screenSetupToken
+			// Initialize token input
+			ti := textinput.New()
+			ti.Placeholder = "ghp_xxxxxxxxxxxxxxxxxxxx"
+			ti.Focus()
+			ti.CharLimit = 256
+			ti.Width = 60
+			m.tokenInput = ti
+			return m, textinput.Blink
+		}
+		m.oauthDeviceCode = msg.deviceCode
+		m.oauthUserCode = msg.userCode
+		m.oauthVerificationURI = msg.verificationURI
+		m.oauthInterval = msg.interval
+		m.screen = screenOAuthWaiting
+		m.statusMessage = "Waiting for authentication..."
+		m.errorMessage = ""
+		// Start polling for access token
+		return m, pollForAccessTokenCmd(msg.deviceCode, msg.interval)
+
+	case OAuthCompleteMsg:
+		// Handle OAuth completion
+		if msg.err != nil {
+			m.errorMessage = fmt.Sprintf("OAuth failed: %v", msg.err)
+			m.statusMessage = "Falling back to manual token entry..."
+			// Automatically switch to manual token entry after a short delay
+			m.screen = screenSetupToken
+			// Initialize token input
+			ti := textinput.New()
+			ti.Placeholder = "ghp_xxxxxxxxxxxxxxxxxxxx"
+			ti.Focus()
+			ti.CharLimit = 256
+			ti.Width = 60
+			m.tokenInput = ti
+			return m, textinput.Blink
+		}
+		// Save token to config
+		_ = db.SetConfig("github_token", msg.accessToken)
+		m.statusMessage = "GitHub authentication successful!"
+		m.errorMessage = ""
+		m.screen = screenList
+		return m, reloadProjectsCmd()
 
 	case reloadMsg:
 		// Load projects into list and switch to list screen
@@ -816,11 +910,43 @@ func (m model) updateSetup(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) updateCloudSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		// Handle filter input when filtering mode is active
+		if m.cloudFiltering {
+			switch msg.String() {
+			case "esc":
+				// Exit filter mode
+				m.cloudFiltering = false
+				m.cloudFilterInput.Blur()
+				m.cloudFilterInput.SetValue("")
+				m.cloudCursorIndex = 0
+				m.errorMessage = ""
+				return m, nil
+			case "enter":
+				// Exit filter mode and keep the filter
+				m.cloudFiltering = false
+				m.cloudFilterInput.Blur()
+				m.cloudCursorIndex = 0
+				m.errorMessage = ""
+				return m, nil
+			default:
+				// Update filter input
+				var cmd tea.Cmd
+				m.cloudFilterInput, cmd = m.cloudFilterInput.Update(msg)
+				// Reset cursor when filter changes
+				m.cloudCursorIndex = 0
+				m.errorMessage = ""
+				return m, cmd
+			}
+		}
+
 		switch msg.String() {
 		case "ctrl+c", "q":
 			m.screen = screenList
 			m.cloudProjects = nil
 			m.selectedCloudIndices = nil
+			m.cloudCursorIndex = 0
+			m.cloudFiltering = false
+			m.cloudFilterInput.SetValue("")
 			return m, nil
 
 		case "enter":
@@ -835,13 +961,199 @@ func (m model) updateCloudSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.screen = screenList
 			m.cloudProjects = nil
 			m.selectedCloudIndices = nil
+			m.cloudCursorIndex = 0
+			m.cloudFiltering = false
+			m.cloudFilterInput.SetValue("")
+			return m, nil
+
+		case "/":
+			// Enter filter mode
+			m.cloudFiltering = true
+			m.cloudFilterInput.Focus()
+			m.errorMessage = ""
+			return m, textinput.Blink
+
+		case "up", "k":
+			// Move cursor up in filtered list
+			filteredIndices := m.getFilteredIndices()
+			if len(filteredIndices) == 0 {
+				return m, nil
+			}
+
+			// Find current position in filtered list
+			currentPos := -1
+			for i, idx := range filteredIndices {
+				if idx == m.cloudCursorIndex {
+					currentPos = i
+					break
+				}
+			}
+
+			// Move to previous item in filtered list
+			if currentPos > 0 {
+				m.cloudCursorIndex = filteredIndices[currentPos-1]
+			} else if currentPos == -1 && len(filteredIndices) > 0 {
+				// Cursor not in filtered list, move to last filtered item
+				m.cloudCursorIndex = filteredIndices[len(filteredIndices)-1]
+			}
+			m.errorMessage = ""
+			return m, nil
+
+		case "down", "j":
+			// Move cursor down in filtered list
+			filteredIndices := m.getFilteredIndices()
+			if len(filteredIndices) == 0 {
+				return m, nil
+			}
+
+			// Find current position in filtered list
+			currentPos := -1
+			for i, idx := range filteredIndices {
+				if idx == m.cloudCursorIndex {
+					currentPos = i
+					break
+				}
+			}
+
+			// Move to next item in filtered list
+			if currentPos >= 0 && currentPos < len(filteredIndices)-1 {
+				m.cloudCursorIndex = filteredIndices[currentPos+1]
+			} else if currentPos == -1 && len(filteredIndices) > 0 {
+				// Cursor not in filtered list, move to first filtered item
+				m.cloudCursorIndex = filteredIndices[0]
+			}
+			m.errorMessage = ""
+			return m, nil
+
+		case "pgup":
+			// Jump up by 10 items in filtered list
+			filteredIndices := m.getFilteredIndices()
+			if len(filteredIndices) == 0 {
+				return m, nil
+			}
+
+			currentPos := -1
+			for i, idx := range filteredIndices {
+				if idx == m.cloudCursorIndex {
+					currentPos = i
+					break
+				}
+			}
+
+			if currentPos >= 0 {
+				newPos := max(0, currentPos-10)
+				m.cloudCursorIndex = filteredIndices[newPos]
+			} else if len(filteredIndices) > 0 {
+				m.cloudCursorIndex = filteredIndices[len(filteredIndices)-1]
+			}
+			m.errorMessage = ""
+			return m, nil
+
+		case "pgdown":
+			// Jump down by 10 items in filtered list
+			filteredIndices := m.getFilteredIndices()
+			if len(filteredIndices) == 0 {
+				return m, nil
+			}
+
+			currentPos := -1
+			for i, idx := range filteredIndices {
+				if idx == m.cloudCursorIndex {
+					currentPos = i
+					break
+				}
+			}
+
+			if currentPos >= 0 {
+				newPos := min(len(filteredIndices)-1, currentPos+10)
+				m.cloudCursorIndex = filteredIndices[newPos]
+			} else if len(filteredIndices) > 0 {
+				m.cloudCursorIndex = filteredIndices[0]
+			}
+			m.errorMessage = ""
+			return m, nil
+
+		case "home", "g":
+			// Jump to first item in filtered list
+			filteredIndices := m.getFilteredIndices()
+			if len(filteredIndices) > 0 {
+				m.cloudCursorIndex = filteredIndices[0]
+			}
+			m.errorMessage = ""
+			return m, nil
+
+		case "end", "G":
+			// Jump to last item in filtered list
+			filteredIndices := m.getFilteredIndices()
+			if len(filteredIndices) > 0 {
+				m.cloudCursorIndex = filteredIndices[len(filteredIndices)-1]
+			}
+			m.errorMessage = ""
+			return m, nil
+
+		case " ", "tab":
+			// Toggle selection at current cursor position
+			idx := m.cloudCursorIndex
+			found := false
+			for i, selectedIdx := range m.selectedCloudIndices {
+				if selectedIdx == idx {
+					// Remove from selection
+					m.selectedCloudIndices = append(m.selectedCloudIndices[:i], m.selectedCloudIndices[i+1:]...)
+					found = true
+					break
+				}
+			}
+			if !found {
+				// Add to selection
+				m.selectedCloudIndices = append(m.selectedCloudIndices, idx)
+			}
+			m.errorMessage = ""
+			return m, nil
+
+		case "a":
+			// Select all filtered projects
+			filteredIndices := m.getFilteredIndices()
+			m.selectedCloudIndices = filteredIndices
+			m.errorMessage = ""
+			if len(filteredIndices) == len(m.cloudProjects) {
+				m.statusMessage = fmt.Sprintf("Selected all %d projects", len(filteredIndices))
+			} else {
+				m.statusMessage = fmt.Sprintf("Selected all %d filtered projects", len(filteredIndices))
+			}
+			return m, nil
+
+		case "n":
+			// Clear all selections
+			m.selectedCloudIndices = nil
+			m.errorMessage = ""
+			m.statusMessage = "Cleared all selections"
+			return m, nil
+
+		case "i":
+			// Invert selection
+			newSelection := []int{}
+			for i := range m.cloudProjects {
+				isSelected := false
+				for _, selectedIdx := range m.selectedCloudIndices {
+					if selectedIdx == i {
+						isSelected = true
+						break
+					}
+				}
+				if !isSelected {
+					newSelection = append(newSelection, i)
+				}
+			}
+			m.selectedCloudIndices = newSelection
+			m.errorMessage = ""
+			m.statusMessage = fmt.Sprintf("Inverted selection (%d selected)", len(newSelection))
 			return m, nil
 
 		default:
-			// Handle number keys for selection (1-9)
+			// Handle number keys for quick selection (1-9) - legacy support
 			if len(msg.String()) == 1 {
 				num := int(msg.String()[0] - '0')
-				if num >= 1 && num <= len(m.cloudProjects) {
+				if num >= 1 && num <= min(9, len(m.cloudProjects)) {
 					idx := num - 1
 					// Toggle selection
 					found := false
@@ -857,6 +1169,7 @@ func (m model) updateCloudSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 						// Add to selection
 						m.selectedCloudIndices = append(m.selectedCloudIndices, idx)
 					}
+					m.errorMessage = ""
 					return m, nil
 				}
 			}
@@ -872,6 +1185,7 @@ func (m model) updateCloudSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.screen = screenList
 		m.cloudProjects = nil
 		m.selectedCloudIndices = nil
+		m.cloudCursorIndex = 0
 		// Reload the list to show the new archived projects
 		return m, reloadProjectsCmd()
 	}
@@ -881,7 +1195,7 @@ func (m model) updateCloudSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // View renders the UI
 func (m model) View() string {
-	if m.screen == screenSetupPath || m.screen == screenSetupToken {
+	if m.screen == screenSetupPath || m.screen == screenSetupGitHub || m.screen == screenSetupToken || m.screen == screenOAuthWaiting {
 		return m.viewSetup()
 	}
 	if m.screen == screenCloudSelect {
@@ -926,38 +1240,166 @@ func (m model) viewSetup() string {
 			Render("\nPress Enter to start scan | Ctrl+C to quit")
 		s += helpText
 
-	} else if m.screen == screenSetupToken {
-		// Title
-		title := lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#00FFFF")).
+	} else if m.screen == screenSetupGitHub {
+		// Title box with consistent styling
+		titleBox := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("#00FFFF")).
+			Padding(0, 2).
 			Bold(true).
-			Render("\n╔═══════════════════════════════════════════════════════════╗\n" +
-				"║            Configure GitHub Integration                 ║\n" +
-				"╚═══════════════════════════════════════════════════════════╝\n")
-		s += title
+			Foreground(lipgloss.Color("#00FFFF")).
+			Render("Configure GitHub Integration")
 
-		// Prompt
-		prompt := lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFFFFF")).
-			Render("\nEnter your GitHub Personal Access Token for cloud sync:\n")
-		s += prompt
+		s += "\n" + titleBox + "\n\n"
 
-		// Info
-		info := lipgloss.NewStyle().
+		// Authentication options
+		oauthBox := lipgloss.NewStyle().
+			Width(58).
+			Padding(1, 2).
+			Border(lipgloss.NormalBorder()).
+			BorderForeground(lipgloss.Color("#00FF00")).
+			Render(
+				lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF00")).Bold(true).Render("Option 1: OAuth Device Flow (Recommended)") + "\n\n" +
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Render("• Secure browser-based authentication") + "\n" +
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Render("• No manual token creation needed") + "\n" +
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Render("• Automatic token management") + "\n\n" +
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Render("Press ENTER to start OAuth flow"),
+			)
+
+		s += oauthBox + "\n\n"
+
+		patBox := lipgloss.NewStyle().
+			Width(58).
+			Padding(1, 2).
+			Border(lipgloss.NormalBorder()).
+			BorderForeground(lipgloss.Color("#FFFF00")).
+			Render(
+				lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFF00")).Bold(true).Render("Option 2: Personal Access Token") + "\n\n" +
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Render("• Manual token creation required") + "\n" +
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Render("• Create token at github.com/settings/tokens") + "\n" +
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Render("• Requires 'gist' scope only") + "\n\n" +
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Render("Press P for manual token entry"),
+			)
+
+		s += patBox + "\n\n"
+
+		// Help text
+		skipBox := lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#888888")).
-			Render("This enables syncing your projects to GitHub Gists.\n" +
-				"Create a token at: https://github.com/settings/tokens\n" +
-				"Required scopes: gist (read/write)\n\n")
-		s += info
+			Render("Press S to skip setup  •  Ctrl+C to quit")
+
+		s += skipBox
+
+	} else if m.screen == screenSetupToken {
+		// Title box
+		titleBox := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("#FFFF00")).
+			Padding(0, 2).
+			Bold(true).
+			Foreground(lipgloss.Color("#FFFF00")).
+			Render("Enter GitHub Personal Access Token")
+
+		s += "\n" + titleBox + "\n\n"
+
+		// Instructions
+		instructions := lipgloss.NewStyle().
+			Width(60).
+			Padding(1, 2).
+			Border(lipgloss.NormalBorder()).
+			BorderForeground(lipgloss.Color("#444444")).
+			Render(
+				lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Render("Create a Personal Access Token:") + "\n\n" +
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#00FFFF")).Render("1. Visit: https://github.com/settings/tokens") + "\n" +
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#00FFFF")).Render("2. Click 'Generate new token (classic)'") + "\n" +
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#00FFFF")).Render("3. Select only 'gist' scope") + "\n" +
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#00FFFF")).Render("4. Copy the token and paste below") + "\n\n" +
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Render("Token will be stored securely in your local database."),
+			)
+
+		s += instructions + "\n\n"
 
 		// Input field
-		s += m.tokenInput.View() + "\n"
+		s += m.tokenInput.View() + "\n\n"
 
 		// Help text
 		helpText := lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#888888")).
-			Render("\nPress Enter to save (leave empty to skip) | Ctrl+C to quit")
+			Render("Press Enter to save token  •  Press Esc to go back  •  Ctrl+C to quit")
+
 		s += helpText
+
+	} else if m.screen == screenOAuthWaiting {
+		// Title box
+		titleBox := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("#00FFFF")).
+			Padding(0, 2).
+			Bold(true).
+			Foreground(lipgloss.Color("#00FFFF")).
+			Render("GitHub Authentication in Progress")
+
+		s += "\n" + titleBox + "\n\n"
+
+		// Instructions header
+		instructionsHeader := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Bold(true).
+			Render("Please complete the following steps:")
+
+		s += instructionsHeader + "\n\n"
+
+		// Step 1 - Visit URL (in a box for emphasis)
+		step1Box := lipgloss.NewStyle().
+			Width(60).
+			Padding(1, 2).
+			Border(lipgloss.NormalBorder()).
+			BorderForeground(lipgloss.Color("#00FF00")).
+			Render(
+				lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF00")).Bold(true).Render("STEP 1: Visit this URL") + "\n\n" +
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Render(m.oauthVerificationURI),
+			)
+
+		s += step1Box + "\n\n"
+
+		// Step 2 - Enter code (highlighted box)
+		step2Box := lipgloss.NewStyle().
+			Width(60).
+			Padding(1, 2).
+			Border(lipgloss.DoubleBorder()).
+			BorderForeground(lipgloss.Color("#FFFF00")).
+			Render(
+				lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFF00")).Bold(true).Render("STEP 2: Enter this code") + "\n\n" +
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFF00")).Bold(true).Render(m.oauthUserCode),
+			)
+
+		s += step2Box + "\n\n"
+
+		// Step 3 - Authorize
+		step3Box := lipgloss.NewStyle().
+			Width(60).
+			Padding(1, 2).
+			Border(lipgloss.NormalBorder()).
+			BorderForeground(lipgloss.Color("#00FF00")).
+			Render(
+				lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF00")).Bold(true).Render("STEP 3: Authorize DevBase") + "\n\n" +
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Render("Grant DevBase access to your Gists"),
+			)
+
+		s += step3Box + "\n\n"
+
+		// Waiting indicator with animation suggestion
+		waitingMsg := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#00FFFF")).
+			Bold(true).
+			Render("⟳ Waiting for authorization...")
+
+		waitingSubtext := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#888888")).
+			Italic(true).
+			Render("This window will automatically continue once you authorize")
+
+		s += waitingMsg + "\n" + waitingSubtext
 	}
 
 	// Display error message if present
@@ -992,50 +1434,176 @@ func (m model) viewCloudSelect() string {
 	titleBox := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("#00FFFF")).
-		Padding(0, 1).
+		Padding(0, 2).
 		Bold(true).
+		Foreground(lipgloss.Color("#00FFFF")).
 		Render("Select Projects from Cloud")
 
-	s := titleBox + "\n\n"
+	s := "\n" + titleBox + "\n\n"
 
-	// Instructions
-	instructions := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#FFFFFF")).
-		Render("Select projects to load from cloud (they will be marked as archived):\n\n")
-	s += instructions
+	// Instructions box
+	instructionsBox := lipgloss.NewStyle().
+		Width(68).
+		Padding(1, 2).
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color("#444444")).
+		Render(
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Render("Select projects to load from cloud") + "\n" +
+				lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Render("Selected projects will be marked as archived for safety"),
+		)
+	s += instructionsBox + "\n\n"
 
-	// Calculate max name length for alignment
-	maxLen := 0
-	for _, project := range m.cloudProjects {
-		if len(project.Name) > maxLen {
-			maxLen = len(project.Name)
+	// Show filter input if filtering is active
+	if m.cloudFiltering {
+		filterBox := lipgloss.NewStyle().
+			Width(68).
+			Padding(0, 2).
+			Border(lipgloss.NormalBorder()).
+			BorderForeground(lipgloss.Color("#00FFFF")).
+			Render(m.cloudFilterInput.View())
+		s += filterBox + "\n\n"
+	}
+
+	// Apply filter to projects and track original indices
+	type filteredProject struct {
+		project     models.Project
+		originalIdx int
+	}
+
+	filteredProjects := []filteredProject{}
+	filterText := strings.ToLower(strings.TrimSpace(m.cloudFilterInput.Value()))
+
+	for i, project := range m.cloudProjects {
+		if filterText == "" {
+			filteredProjects = append(filteredProjects, filteredProject{project: project, originalIdx: i})
+		} else if strings.Contains(strings.ToLower(project.Name), filterText) ||
+			strings.Contains(strings.ToLower(project.Path), filterText) ||
+			strings.Contains(strings.ToLower(project.RepoURL), filterText) {
+			filteredProjects = append(filteredProjects, filteredProject{project: project, originalIdx: i})
 		}
 	}
 
-	// List cloud projects with aligned formatting
-	for i, project := range m.cloudProjects {
-		selected := "[ ] "
+	// Calculate max name length for proper alignment
+	maxNameLen := 0
+	maxNumberLen := len(fmt.Sprintf("%d", len(filteredProjects)))
+	for _, fp := range filteredProjects {
+		if len(fp.project.Name) > maxNameLen {
+			maxNameLen = len(fp.project.Name)
+		}
+	}
+
+	// Project list container with count
+	projectCountInfo := ""
+	if filterText != "" {
+		projectCountInfo = fmt.Sprintf(" (%d of %d)", len(filteredProjects), len(m.cloudProjects))
+	}
+	projectListHeader := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#00FFFF")).
+		Bold(true).
+		Render("Available Projects:" + projectCountInfo)
+	s += projectListHeader + "\n\n"
+
+	// If no projects match filter
+	if len(filteredProjects) == 0 {
+		noResultsMsg := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#888888")).
+			Render("  No projects match the filter")
+		s += noResultsMsg + "\n"
+	}
+
+	// List cloud projects with aligned formatting and cursor
+	for i, fp := range filteredProjects {
+		originalIdx := fp.originalIdx
+		project := fp.project
+
+		isSelected := false
 		for _, idx := range m.selectedCloudIndices {
-			if idx == i {
-				selected = "[✓] "
+			if idx == originalIdx {
+				isSelected = true
 				break
 			}
 		}
 
-		projectStyle := lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFFFFF"))
-		if strings.Contains(selected, "✓") {
-			projectStyle = projectStyle.Foreground(lipgloss.Color("#00FF00"))
+		isCursor := (originalIdx == m.cloudCursorIndex)
+
+		// Build the line with proper alignment
+		checkbox := "[ ]"
+		if isSelected {
+			checkbox = "[✓]"
 		}
 
-		line := fmt.Sprintf("%s%d. %-*s", selected, i+1, maxLen, project.Name)
-		s += projectStyle.Render(line) + "\n"
+		// Cursor indicator
+		cursor := " "
+		if isCursor {
+			cursor = "►"
+		}
+
+		number := fmt.Sprintf("%*d.", maxNumberLen, i+1)
+		projectName := fmt.Sprintf("%-*s", maxNameLen, project.Name)
+
+		// Additional info if available
+		var additionalInfo string
+		if project.RepoURL != "" {
+			iconColor := "#666666"
+			if isCursor {
+				iconColor = "#00FFFF"
+			}
+			additionalInfo = lipgloss.NewStyle().
+				Foreground(lipgloss.Color(iconColor)).
+				Render(" 🔗")
+		}
+
+		// Style based on cursor position and selection
+		lineStyle := lipgloss.NewStyle()
+
+		if isCursor && isSelected {
+			// Cursor on selected item
+			lineStyle = lineStyle.
+				Background(lipgloss.Color("#00AA00")).
+				Foreground(lipgloss.Color("#000000")).
+				Bold(true)
+		} else if isCursor {
+			// Cursor on unselected item
+			lineStyle = lineStyle.
+				Background(lipgloss.Color("#444444")).
+				Foreground(lipgloss.Color("#FFFFFF")).
+				Bold(true)
+		} else if isSelected {
+			// Selected but not cursor
+			lineStyle = lineStyle.
+				Foreground(lipgloss.Color("#00FF00")).
+				Bold(true)
+		} else {
+			// Normal item
+			lineStyle = lineStyle.
+				Foreground(lipgloss.Color("#FFFFFF"))
+		}
+
+		line := fmt.Sprintf("%s %s %s %s%s", cursor, checkbox, number, projectName, additionalInfo)
+		s += lineStyle.Render(line) + "\n"
 	}
 
-	// Help text
+	// Selection summary
+	if len(m.selectedCloudIndices) > 0 {
+		summaryBox := lipgloss.NewStyle().
+			MarginTop(1).
+			Padding(0, 2).
+			Foreground(lipgloss.Color("#00FF00")).
+			Render(fmt.Sprintf("✓ %d project(s) selected", len(m.selectedCloudIndices)))
+		s += "\n" + summaryBox + "\n"
+	} else {
+		summaryBox := lipgloss.NewStyle().
+			MarginTop(1).
+			Padding(0, 2).
+			Foreground(lipgloss.Color("#888888")).
+			Render("No projects selected")
+		s += "\n" + summaryBox + "\n"
+	}
+
+	// Compact help text - single line format
 	helpText := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#888888")).
-		Render("\nKeys: 1-9=select  enter=load selected  esc=cancel")
+		Render("\n↑↓/jk=navigate  space=toggle  /=filter  a=all  n=none  enter=load  esc=cancel")
 	s += helpText
 
 	// Display error message if present
@@ -1069,11 +1637,11 @@ func (m model) viewList() string {
 	if token, err := db.GetConfig("github_token"); err != nil || token == "" {
 		tokenStatus = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#FFAA00")).
-			Render("\n☁ Cloud sync disabled - GitHub token not configured (press 't' to configure)")
+			Render("\n☁ Cloud sync disabled - GitHub OAuth not configured (press 't' to authenticate)")
 	} else {
 		tokenStatus = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#00AA00")).
-			Render("\n☁ Cloud sync enabled")
+			Render("\n☁ Cloud sync enabled (authenticated)")
 	}
 	view += tokenStatus
 
@@ -1122,40 +1690,74 @@ func (m model) viewList() string {
 	if m.confirmArchive && m.archiveProject != nil {
 		hasRepoURL := m.archiveProject.project.RepoURL != ""
 
-		titleStyle := lipgloss.NewStyle().
+		// Warning title box
+		warningTitle := lipgloss.NewStyle().
+			Border(lipgloss.DoubleBorder()).
+			BorderForeground(lipgloss.Color("#FF0000")).
+			Padding(0, 2).
+			Bold(true).
 			Foreground(lipgloss.Color("#FF0000")).
-			Bold(true)
+			Render("⚠ WARNING: ARCHIVE PROJECT")
 
-		infoStyle := lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFFFFF"))
+		archivePrompt = "\n\n" + warningTitle + "\n\n"
 
-		restoreInfoStyle := lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#00AA00"))
+		// Project information box
+		projectInfoBox := lipgloss.NewStyle().
+			Width(70).
+			Padding(1, 2).
+			Border(lipgloss.NormalBorder()).
+			BorderForeground(lipgloss.Color("#444444")).
+			Render(
+				lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Bold(true).Render("Project Details:") + "\n\n" +
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#00FFFF")).Render("Name: ") +
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Render(m.archiveProject.project.Name) + "\n" +
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#00FFFF")).Render("Path: ") +
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Render(m.archiveProject.project.Path),
+			)
 
-		noRestoreStyle := lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFAA00"))
+		archivePrompt += projectInfoBox + "\n\n"
 
-		archivePrompt = "\n\n" +
-			titleStyle.Render("⚠ WARNING: ARCHIVE PROJECT") + "\n\n" +
-			infoStyle.Render(fmt.Sprintf("Project: %s\n", m.archiveProject.project.Name)) +
-			infoStyle.Render(fmt.Sprintf("Path: %s\n\n", m.archiveProject.project.Path))
-
+		// Restore capability box
 		if hasRepoURL {
-			archivePrompt += restoreInfoStyle.Render("✓ This project CAN be restored from:\n") +
-				restoreInfoStyle.Render(fmt.Sprintf("  %s\n\n", m.archiveProject.project.RepoURL))
+			restoreBox := lipgloss.NewStyle().
+				Width(70).
+				Padding(1, 2).
+				Border(lipgloss.NormalBorder()).
+				BorderForeground(lipgloss.Color("#00FF00")).
+				Render(
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF00")).Bold(true).Render("✓ Restore Available") + "\n\n" +
+						lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Render("This project can be restored from:") + "\n" +
+						lipgloss.NewStyle().Foreground(lipgloss.Color("#00FFFF")).Render(m.archiveProject.project.RepoURL),
+				)
+			archivePrompt += restoreBox + "\n\n"
 		} else {
-			archivePrompt += noRestoreStyle.Render("⚠ WARNING: No git repository URL found!\n") +
-				noRestoreStyle.Render("  This project CANNOT be restored after archiving.\n\n")
+			warningBox := lipgloss.NewStyle().
+				Width(70).
+				Padding(1, 2).
+				Border(lipgloss.DoubleBorder()).
+				BorderForeground(lipgloss.Color("#FFAA00")).
+				Render(
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#FFAA00")).Bold(true).Render("⚠ PERMANENT DELETION WARNING") + "\n\n" +
+						lipgloss.NewStyle().Foreground(lipgloss.Color("#FF0000")).Render("No git repository URL found!") + "\n" +
+						lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Render("This project CANNOT be restored after archiving.") + "\n" +
+						lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Render("All files will be permanently deleted."),
+				)
+			archivePrompt += warningBox + "\n\n"
 		}
 
-		archivePrompt += lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FF0000")).
-			Bold(true).
-			Render("Type 'DELETE' to confirm archive: ") + "\n" +
-			m.archiveConfirmInput.View() + "\n\n" +
-			lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#888888")).
-				Render("Press Enter to confirm | ESC to cancel")
+		// Confirmation input box
+		confirmBox := lipgloss.NewStyle().
+			Width(70).
+			Padding(1, 2).
+			Border(lipgloss.ThickBorder()).
+			BorderForeground(lipgloss.Color("#FF0000")).
+			Render(
+				lipgloss.NewStyle().Foreground(lipgloss.Color("#FF0000")).Bold(true).Render("Type 'DELETE' to confirm:") + "\n\n" +
+					m.archiveConfirmInput.View() + "\n\n" +
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Render("Press Enter to confirm  •  ESC to cancel"),
+			)
+
+		archivePrompt += confirmBox
 	}
 
 	// Add confirmation prompt if in clear all mode
@@ -1176,12 +1778,12 @@ func (m model) viewList() string {
 		// Token not configured
 		helpText = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#888888")).
-			Render("\n\nKeys: enter=open  o=browser  x=run  s=scan  g=clone  t=token  c=clear-all  d=archive  r=restore  /=filter  q=quit")
+			Render("\n\nKeys: enter=open  o=browser  x=run  s=scan  g=clone  t=github-oauth  c=clear-all  d=archive  r=restore  /=filter  q=quit")
 	} else {
 		// Token configured
 		helpText = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#888888")).
-			Render("\n\nKeys: enter=open  o=browser  x=run  s=scan  g=clone  u=sync-up  l=select-cloud  t=token  c=clear-all  d=archive  r=restore  /=filter  q=quit")
+			Render("\n\nKeys: enter=open  o=browser  x=run  s=scan  g=clone  u=sync-up  l=select-cloud  t=github-oauth  c=clear-all  d=archive  r=restore  /=filter  q=quit")
 	}
 
 	// Build output without extra docStyle wrapping to avoid layout issues
@@ -1221,6 +1823,12 @@ func NewModel() (model, error) {
 			ti.SetValue(homeDir)
 		}
 
+		// Create cloud filter input
+		cloudFilter := textinput.New()
+		cloudFilter.Placeholder = "Type to filter projects..."
+		cloudFilter.CharLimit = 100
+		cloudFilter.Width = 50
+
 		return model{
 			screen:               screenSetupPath,
 			pathInput:            ti,
@@ -1235,6 +1843,9 @@ func NewModel() (model, error) {
 			cloneInput:           textinput.New(),
 			cloudProjects:        nil,
 			selectedCloudIndices: nil,
+			cloudCursorIndex:     0,
+			cloudFilterInput:     cloudFilter,
+			cloudFiltering:       false,
 			rootScanPath:         rootPath,
 			width:                80,
 			height:               24,
@@ -1248,6 +1859,12 @@ func NewModel() (model, error) {
 		items[i] = projectItem{project: p, isLoading: false}
 	}
 	l.SetItems(items)
+
+	// Create cloud filter input
+	cloudFilter := textinput.New()
+	cloudFilter.Placeholder = "Type to filter projects..."
+	cloudFilter.CharLimit = 100
+	cloudFilter.Width = 50
 
 	return model{
 		screen:               screenList,
@@ -1263,6 +1880,9 @@ func NewModel() (model, error) {
 		cloneInput:           textinput.New(),
 		cloudProjects:        nil,
 		selectedCloudIndices: nil,
+		cloudCursorIndex:     0,
+		cloudFilterInput:     cloudFilter,
+		cloudFiltering:       false,
 		rootScanPath:         rootPath,
 		width:                80,
 		height:               24,
@@ -1575,7 +2195,7 @@ func syncToCloudCmd() tea.Cmd {
 		// Get GitHub token from config
 		token, err := db.GetConfig("github_token")
 		if err != nil || token == "" {
-			return SyncToCloudMsg{err: fmt.Errorf("GitHub token not configured. Please set 'github_token' in config")}
+			return SyncToCloudMsg{err: fmt.Errorf("GitHub authentication required. Please authenticate with OAuth (press 't')")}
 		}
 
 		// Validate token
@@ -1612,7 +2232,7 @@ func loadFromCloudCmd() tea.Cmd {
 		// Get GitHub token from config
 		token, err := db.GetConfig("github_token")
 		if err != nil || token == "" {
-			return LoadFromCloudMsg{err: fmt.Errorf("GitHub token not configured. Please set 'github_token' in config")}
+			return LoadFromCloudMsg{err: fmt.Errorf("GitHub authentication required. Please authenticate with OAuth (press 't')")}
 		}
 
 		// Validate token
@@ -1659,7 +2279,7 @@ func listCloudProjectsCmd() tea.Cmd {
 		// Get GitHub token from config
 		token, err := db.GetConfig("github_token")
 		if err != nil || token == "" {
-			return ListCloudProjectsMsg{err: fmt.Errorf("GitHub token not configured")}
+			return ListCloudProjectsMsg{err: fmt.Errorf("GitHub authentication required. Please authenticate with OAuth (press 't')")}
 		}
 
 		// Validate token
@@ -1720,4 +2340,80 @@ func loadSelectedProjectsCmd(selectedIndices []int, cloudProjects []models.Proje
 
 		return LoadSelectedProjectsMsg{projectsLoaded: loadedCount}
 	}
+}
+
+// initiateOAuthCmd creates a command that initiates the GitHub OAuth device flow
+func initiateOAuthCmd() tea.Cmd {
+	return func() tea.Msg {
+		oauthClient := engine.NewOAuthClient()
+
+		deviceResp, err := oauthClient.InitiateDeviceFlow()
+		if err != nil {
+			return OAuthDeviceCodeMsg{err: err}
+		}
+
+		return OAuthDeviceCodeMsg{
+			deviceCode:      deviceResp.DeviceCode,
+			userCode:        deviceResp.UserCode,
+			verificationURI: deviceResp.VerificationURI,
+			interval:        deviceResp.Interval,
+			err:             nil,
+		}
+	}
+}
+
+// pollForAccessTokenCmd creates a command that polls for the OAuth access token
+func pollForAccessTokenCmd(deviceCode string, interval int) tea.Cmd {
+	return func() tea.Msg {
+		oauthClient := engine.NewOAuthClient()
+
+		accessToken, err := oauthClient.PollForAccessToken(deviceCode, interval)
+		if err != nil {
+			return OAuthCompleteMsg{err: err}
+		}
+
+		return OAuthCompleteMsg{
+			accessToken: accessToken,
+			err:         nil,
+		}
+	}
+}
+
+// Helper functions for min/max
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// getFilteredIndices returns a list of original indices that match the filter
+func (m model) getFilteredIndices() []int {
+	filterText := strings.ToLower(strings.TrimSpace(m.cloudFilterInput.Value()))
+	if filterText == "" {
+		// No filter - return all indices
+		indices := make([]int, len(m.cloudProjects))
+		for i := range m.cloudProjects {
+			indices[i] = i
+		}
+		return indices
+	}
+
+	// Filter and return matching indices
+	indices := []int{}
+	for i, project := range m.cloudProjects {
+		if strings.Contains(strings.ToLower(project.Name), filterText) ||
+			strings.Contains(strings.ToLower(project.Path), filterText) ||
+			strings.Contains(strings.ToLower(project.RepoURL), filterText) {
+			indices = append(indices, i)
+		}
+	}
+	return indices
 }

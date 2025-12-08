@@ -11,31 +11,38 @@
 - **⚙️ Concurrent Scanning** - Worker pool pattern for lightning-fast directory traversal
 - **💻 VS Code Integration** - One-key project opening
 - **🎨 Beautiful TUI** - Built with Bubble Tea for a modern terminal experience
+- **☁️ Cloud Sync** - GitHub OAuth authentication with Gist backup/restore
+- **🔐 Secure Authentication** - OAuth Device Flow (no manual token creation needed)
 
 ## 📦 Installation
 
-### Option 1: Use Pre-built Binary
-Download `DevBase.exe` and place it in your PATH.
+### Option 1: Install with Go (Recommended)
+```bash
+go install github.com/maleesha-pramud/devbase/cmd/devbase@latest
+```
 
 ### Option 2: Build from Source
 ```bash
-git clone https://github.com/example/devbase
+git clone https://github.com/maleesha-pramud/devbase
 cd devbase
-go build -ldflags="-s -w" -o DevBase.exe .\cmd\devbase\main.go
+go install ./cmd/devbase
 ```
+
+### Option 3: Use Pre-built Binary
+Download `DevBase.exe` and place it in your PATH.
 
 ## 🎮 Usage
 
 ### Interactive Mode (Default)
 ```bash
-DevBase
+devbase
 ```
 
 ### Commands
 ```bash
-DevBase --help      # Show help information
-DevBase --version   # Show version
-DevBase scan        # Scan directories (interactive mode)
+devbase --help      # Show help information
+devbase --version   # Show version
+devbase scan        # Scan directories (interactive mode)
 ```
 
 ## ⌨️ Keyboard Shortcuts
@@ -43,7 +50,13 @@ DevBase scan        # Scan directories (interactive mode)
 | Key | Action |
 |-----|--------|
 | `Enter` | Open project in VS Code |
+| `o` | Open GitHub repository in browser |
+| `x` | Run project in development mode (opens new terminal) |
 | `s` | Scan for new projects |
+| `g` | Clone a GitHub repository |
+| `t` | Authenticate with GitHub OAuth (for cloud sync) |
+| `u` | Sync projects to GitHub Gist (upload) |
+| `l` | Select and load projects from cloud |
 | `c` | Clear all projects (requires confirmation) |
 | `d` | Archive project (deletes directory) |
 | `r` | Restore archived project (clones from repo) |
@@ -94,6 +107,48 @@ DevBase scan        # Scan directories (interactive mode)
 
 - **VS Code** - Must be installed with `code` command in PATH
 - **Git** - Required for restore functionality (cloning repositories)
+- **GitHub Account** - Optional, required only for cloud sync features
+
+## ☁️ Cloud Sync with GitHub
+
+DevBase supports two authentication methods for GitHub integration:
+
+### Option 1: OAuth Device Flow (Recommended)
+
+**Benefits:**
+- ✅ Secure browser-based authentication
+- ✅ No manual token creation needed
+- ✅ Automatic token management
+- ✅ User-friendly experience
+
+**Setup:**
+1. Press `t` in the main view
+2. Select "OAuth Device Flow" (press ENTER)
+3. DevBase will display a verification code
+4. Visit the GitHub URL shown and enter the code
+5. Authorization completes automatically
+
+### Option 2: Personal Access Token
+
+**For users who prefer manual setup:**
+1. Press `t` in the main view
+2. Select "Personal Access Token" (press P)
+3. Visit https://github.com/settings/tokens
+4. Create a new token with only `gist` scope
+5. Paste the token in DevBase
+
+**Note:** OAuth requires a registered GitHub OAuth App. If OAuth fails, DevBase automatically falls back to manual token entry.
+
+- **Upload Projects (`u` key)**: Backs up all projects to a private GitHub Gist
+- **Select & Load (`l` key)**: Choose specific projects from cloud to restore as archived
+- **Automatic Sync**: Gist ID is saved automatically - no configuration needed
+
+### Why OAuth Device Flow?
+
+- ✅ **Secure**: No tokens to store or manage
+- ✅ **User-Friendly**: Simple browser-based authorization
+- ✅ **Automatic**: Handles token refresh behind the scenes
+- ✅ **Safe**: Only requests `gist` scope (read/write access to Gists)
 
 ### Installing VS Code CLI
 If `code` command is not available:

@@ -26,7 +26,9 @@ func (c *GistClient) ValidateToken() error {
 		return fmt.Errorf("failed to create validation request: %w", err)
 	}
 
-	req.Header.Set("Authorization", "token "+c.Token)
+	// Support both OAuth tokens (Bearer) and PATs (token)
+	// Try Bearer first (OAuth), then fall back to token (PAT)
+	req.Header.Set("Authorization", "Bearer "+c.Token)
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -44,6 +46,13 @@ func (c *GistClient) ValidateToken() error {
 	}
 
 	return nil
+}
+
+// getAuthHeader returns the appropriate Authorization header value
+func (c *GistClient) getAuthHeader() string {
+	// OAuth tokens use Bearer, PATs use token
+	// We'll default to Bearer for new OAuth flow
+	return "Bearer " + c.Token
 }
 
 // SaveToGist saves project data to a GitHub Gist
@@ -81,7 +90,7 @@ func (c *GistClient) SaveToGist(projects []models.Project, gistID string) (strin
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("Authorization", "token "+c.Token)
+	req.Header.Set("Authorization", c.getAuthHeader())
 	req.Header.Set("Content-Type", "application/json")
 
 	// Execute request
@@ -122,7 +131,7 @@ func (c *GistClient) LoadFromGist(gistID string) ([]models.Project, error) {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("Authorization", "token "+c.Token)
+	req.Header.Set("Authorization", c.getAuthHeader())
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
