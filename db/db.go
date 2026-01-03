@@ -60,7 +60,7 @@ func InitDB(dbPath string) error {
 	sqlDB.SetConnMaxLifetime(time.Hour)
 
 	// Auto-migrate the schema
-	if err := DB.AutoMigrate(&models.Project{}, &models.Config{}); err != nil {
+	if err := DB.AutoMigrate(&models.RootFolder{}, &models.Project{}, &models.Config{}); err != nil {
 		return fmt.Errorf("failed to migrate database: %w", err)
 	}
 
@@ -69,12 +69,26 @@ func InitDB(dbPath string) error {
 }
 
 // GetProjects retrieves all projects sorted by LastOpened descending
+// If a root folder is active, only returns projects from that root folder
 func GetProjects() ([]models.Project, error) {
 	var projects []models.Project
-	result := DB.Order("last_opened DESC").Find(&projects)
-	if result.Error != nil {
-		return nil, fmt.Errorf("failed to retrieve projects: %w", result.Error)
+
+	// Try to get active root folder
+	activeRoot, err := GetActiveRootFolder()
+	if err == nil && activeRoot != nil {
+		// Filter by active root folder
+		result := DB.Where("root_folder_id = ?", activeRoot.ID).Order("last_opened DESC").Find(&projects)
+		if result.Error != nil {
+			return nil, fmt.Errorf("failed to retrieve projects: %w", result.Error)
+		}
+	} else {
+		// No active root folder, return all projects
+		result := DB.Order("last_opened DESC").Find(&projects)
+		if result.Error != nil {
+			return nil, fmt.Errorf("failed to retrieve projects: %w", result.Error)
+		}
 	}
+
 	return projects, nil
 }
 
@@ -149,7 +163,7 @@ func UpdateLastOpened(id uint) error {
 	return nil
 }
 
-// DeleteAllProjects permanently deletes all projects from the database
+// DeleteAllProjects permanently deletes all projects and root folders from the database
 func DeleteAllProjects() (int, error) {
 	var count int64
 
@@ -162,6 +176,11 @@ func DeleteAllProjects() (int, error) {
 	result := DB.Unscoped().Where("1 = 1").Delete(&models.Project{})
 	if result.Error != nil {
 		return 0, fmt.Errorf("failed to delete all projects: %w", result.Error)
+	}
+
+	// Delete all root folders as well
+	if err := DB.Unscoped().Where("1 = 1").Delete(&models.RootFolder{}).Error; err != nil {
+		return 0, fmt.Errorf("failed to delete all root folders: %w", err)
 	}
 
 	return int(count), nil
@@ -200,4 +219,108 @@ func SetConfig(key, value string) error {
 	// Create new
 	config = models.Config{Key: key, Value: value}
 	return DB.Create(&config).Error
+}
+
+// ========== RootFolder Management Functions ==========
+
+// GetAllRootFolders retrieves all root folders
+func GetAllRootFolders() ([]models.RootFolder, error) {
+	var rootFolders []models.RootFolder
+	result := DB.Order("created_at ASC").Find(&rootFolders)
+	if result.Error != nil {
+		return nil, fmt.Errorf("failed to retrieve root folders: %w", result.Error)
+	}
+	return rootFolders, nil
+}
+
+// GetActiveRootFolder retrieves the currently active root folder
+func GetActiveRootFolder() (*models.RootFolder, error) {
+	var rootFolder models.RootFolder
+	result := DB.Where("is_active = ?", true).First(&rootFolder)
+	if result.Error != nil {
+		return nil, fmt.Errorf("failed to retrieve active root folder: %w", result.Error)
+	}
+	return &rootFolder, nil
+}
+
+// GetRootFolderByID retrieves a root folder by its ID
+func GetRootFolderByID(id uint) (*models.RootFolder, error) {
+	var rootFolder models.RootFolder
+	result := DB.First(&rootFolder, id)
+	if result.Error != nil {
+		return nil, fmt.Errorf("failed to retrieve root folder: %w", result.Error)
+	}
+	return &rootFolder, nil
+}
+
+// GetRootFolderByPath retrieves a root folder by its path
+func GetRootFolderByPath(path string) (*models.RootFolder, error) {
+	var rootFolder models.RootFolder
+	result := DB.Where("path = ?", path).First(&rootFolder)
+	if result.Error != nil {
+		return nil, fmt.Errorf("failed to retrieve root folder: %w", result.Error)
+	}
+	return &rootFolder, nil
+}
+
+// AddRootFolder adds a new root folder to the database
+func AddRootFolder(rootFolder *models.RootFolder) error {
+	result := DB.Create(rootFolder)
+	if result.Error != nil {
+		return fmt.Errorf("failed to add root folder: %w", result.Error)
+	}
+	return nil
+}
+
+// UpdateRootFolder updates an existing root folder
+func UpdateRootFolder(rootFolder *models.RootFolder) error {
+	result := DB.Save(rootFolder)
+	if result.Error != nil {
+		return fmt.Errorf("failed to update root folder: %w", result.Error)
+	}
+	return nil
+}
+
+// SetActiveRootFolder sets a root folder as active and deactivates all others
+func SetActiveRootFolder(id uint) error {
+	return DB.Transaction(func(tx *gorm.DB) error {
+		// Deactivate all root folders
+		if err := tx.Model(&models.RootFolder{}).Where("1 = 1").Update("is_active", false).Error; err != nil {
+			return fmt.Errorf("failed to deactivate root folders: %w", err)
+		}
+
+		// Activate the specified root folder
+		if err := tx.Model(&models.RootFolder{}).Where("id = ?", id).Update("is_active", true).Error; err != nil {
+			return fmt.Errorf("failed to activate root folder: %w", err)
+		}
+
+		return nil
+	})
+}
+
+// DeleteRootFolder deletes a root folder and all its associated projects
+func DeleteRootFolder(id uint) error {
+	return DB.Transaction(func(tx *gorm.DB) error {
+		// Delete all projects in this root folder
+		if err := tx.Where("root_folder_id = ?", id).Delete(&models.Project{}).Error; err != nil {
+			return fmt.Errorf("failed to delete projects: %w", err)
+		}
+
+		// Delete the root folder
+		if err := tx.Delete(&models.RootFolder{}, id).Error; err != nil {
+			return fmt.Errorf("failed to delete root folder: %w", err)
+		}
+
+		return nil
+	})
+}
+
+// GetProjectsByRootFolder retrieves all projects for a specific root folder
+func GetProjectsByRootFolder(rootFolderID uint) ([]models.Project, error) {
+	var projects []models.Project
+	result := DB.Where("root_folder_id = ?", rootFolderID).Order("last_opened DESC").Find(&projects)
+	if result.Error != nil {
+		return nil, fmt.Errorf("failed to retrieve projects: %w", result.Error)
+	}
+	return projects, nil
 }

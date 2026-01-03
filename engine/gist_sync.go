@@ -8,22 +8,35 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 )
 
 // GistClient handles GitHub Gist operations
 type GistClient struct {
-	Token  string // GitHub token
-	GistID string // ID of the gist, empty if not created yet
+	Token        string // GitHub token
+	GistID       string // ID of the gist, empty if not created yet (deprecated - use RootFolder.GistID)
+	RootFolderID uint   // ID of the root folder this client is syncing for
 }
 
-// NewGistClient creates a new GistClient with token and loads existing gist ID from database
-func NewGistClient(token string) (*GistClient, error) {
-	gc := &GistClient{Token: token}
+// NewGistClient creates a new GistClient with token and loads existing gist ID from root folder
+func NewGistClient(token string, rootFolderID uint) (*GistClient, error) {
+	gc := &GistClient{
+		Token:        token,
+		RootFolderID: rootFolderID,
+	}
 
-	// Load existing gist ID from database
-	gistID, err := db.GetConfig("gist_id")
-	if err == nil && gistID != "" {
-		gc.GistID = gistID
+	// Load existing gist ID from the root folder
+	if rootFolderID > 0 {
+		rootFolder, err := db.GetRootFolderByID(rootFolderID)
+		if err == nil && rootFolder.GistID != "" {
+			gc.GistID = rootFolder.GistID
+		}
+	} else {
+		// Fallback to old config-based gist ID for backward compatibility
+		gistID, err := db.GetConfig("gist_id")
+		if err == nil && gistID != "" {
+			gc.GistID = gistID
+		}
 	}
 
 	return gc, nil
@@ -67,12 +80,37 @@ func (c *GistClient) getAuthHeader() string {
 
 // SaveToGist saves project data to a GitHub Gist
 func (c *GistClient) SaveToGist(projects []models.Project) error {
+	// Get root folder information for better gist description
+	var rootFolderName string
+	if c.RootFolderID > 0 {
+		rootFolder, err := db.GetRootFolderByID(c.RootFolderID)
+		if err == nil {
+			rootFolderName = rootFolder.Name
+		}
+	}
+
+	// Use root folder name in description if available
+	description := "DevBase project data backup"
+	if rootFolderName != "" {
+		description = fmt.Sprintf("DevBase: %s", rootFolderName)
+	}
+
+	// Create a filename that includes the root folder for better organization
+	filename := "devbase_projects.json"
+	if rootFolderName != "" {
+		// Sanitize the folder name for use in filename
+		sanitizedName := strings.ReplaceAll(rootFolderName, " ", "_")
+		sanitizedName = strings.ReplaceAll(sanitizedName, "/", "_")
+		sanitizedName = strings.ReplaceAll(sanitizedName, "\\", "_")
+		filename = fmt.Sprintf("devbase_%s.json", sanitizedName)
+	}
+
 	// Prepare data for gist
 	data := map[string]interface{}{
-		"description": "DevBase project data backup",
+		"description": description,
 		"public":      false,
 		"files": map[string]interface{}{
-			"devbase_projects.json": map[string]interface{}{
+			filename: map[string]interface{}{
 				"content": c.projectsToJSON(projects),
 			},
 		},
@@ -132,8 +170,22 @@ func (c *GistClient) SaveToGist(projects []models.Project) error {
 
 		// Store the new gist ID
 		c.GistID = gistResp.ID
-		if err := db.SetConfig("gist_id", c.GistID); err != nil {
-			return fmt.Errorf("failed to save gist ID: %w", err)
+
+		// Save to root folder if specified, otherwise use old config method
+		if c.RootFolderID > 0 {
+			rootFolder, err := db.GetRootFolderByID(c.RootFolderID)
+			if err != nil {
+				return fmt.Errorf("failed to get root folder: %w", err)
+			}
+			rootFolder.GistID = c.GistID
+			if err := db.UpdateRootFolder(rootFolder); err != nil {
+				return fmt.Errorf("failed to save gist ID to root folder: %w", err)
+			}
+		} else {
+			// Backward compatibility: save to config
+			if err := db.SetConfig("gist_id", c.GistID); err != nil {
+				return fmt.Errorf("failed to save gist ID: %w", err)
+			}
 		}
 	}
 
@@ -190,12 +242,31 @@ func (c *GistClient) LoadFromGist() ([]models.Project, error) {
 	}
 
 	// Extract project data from the gist file
-	file, exists := gistResp.Files["devbase_projects.json"]
-	if !exists {
-		return nil, fmt.Errorf("devbase_projects.json not found in gist")
+	// Try to find the file - it could be named either "devbase_projects.json"
+	// or "devbase_<rootfolder>.json"
+	var fileContent string
+	var found bool
+
+	// First try the standard filename
+	if file, exists := gistResp.Files["devbase_projects.json"]; exists {
+		fileContent = file.Content
+		found = true
+	} else {
+		// Try to find any file that starts with "devbase_" and ends with ".json"
+		for filename, file := range gistResp.Files {
+			if strings.HasPrefix(filename, "devbase_") && strings.HasSuffix(filename, ".json") {
+				fileContent = file.Content
+				found = true
+				break
+			}
+		}
 	}
 
-	return c.jsonToProjects(file.Content)
+	if !found {
+		return nil, fmt.Errorf("no DevBase project file found in gist")
+	}
+
+	return c.jsonToProjects(fileContent)
 }
 
 // projectsToJSON converts projects slice to JSON string

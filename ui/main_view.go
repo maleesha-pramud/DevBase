@@ -181,6 +181,7 @@ const (
 	screenSetupToken
 	screenOAuthWaiting
 	screenCloudSelect
+	screenRootFolderManage
 	screenList
 )
 
@@ -221,6 +222,12 @@ type model struct {
 	oauthUserCode        string
 	oauthVerificationURI string
 	oauthInterval        int
+	// Root folder management fields
+	rootFolders          []models.RootFolder
+	rootFolderCursor     int
+	activeRootFolderID   uint
+	rootFolderInput      textinput.Model
+	addingRootFolder     bool
 }
 
 // Init initializes the model and loads projects from the database
@@ -255,6 +262,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Handle cloud select screen
 	if m.screen == screenCloudSelect {
 		return m.updateCloudSelect(msg)
+	}
+	
+	// Handle root folder management screen
+	if m.screen == screenRootFolderManage {
+		return m.updateRootFolderManage(msg)
 	}
 
 	// Handle list screen
@@ -544,6 +556,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.errorMessage = ""
 			m.statusMessage = ""
 			return m, nil
+		
+		case "f":
+			// Manage root folders
+			m.screen = screenRootFolderManage
+			m.errorMessage = ""
+			m.statusMessage = ""
+			m.addingRootFolder = false
+			
+			// Load root folders
+			rootFolders, err := db.GetAllRootFolders()
+			if err != nil {
+				m.errorMessage = fmt.Sprintf("Failed to load root folders: %v", err)
+				return m, nil
+			}
+			m.rootFolders = rootFolders
+			m.rootFolderCursor = 0
+			
+			// Get active root folder ID
+			activeRoot, err := db.GetActiveRootFolder()
+			if err == nil {
+				m.activeRootFolderID = activeRoot.ID
+			}
+			
+			return m, nil
 
 		case "esc":
 			// Cancel clear all confirmation
@@ -760,13 +796,33 @@ func (m model) updateSetup(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.errorMessage = "Please enter a valid path"
 					return m, nil
 				}
+				
+				pathValue := m.pathInput.Value()
+				folderName := filepath.Base(pathValue)
+				
+				// Create a root folder for this path
+				rootFolder := &models.RootFolder{
+					Name:     folderName,
+					Path:     pathValue,
+					IsActive: true, // First folder is active by default
+				}
+				
+				if err := db.AddRootFolder(rootFolder); err != nil {
+					m.errorMessage = fmt.Sprintf("Failed to create root folder: %v", err)
+					return m, nil
+				}
+				
 				m.isScanning = true
 				m.statusMessage = "Scanning for projects..."
 				m.errorMessage = ""
-				m.rootScanPath = m.pathInput.Value()
-				// Save root path to config
-				_ = db.SetConfig("root_scan_path", m.pathInput.Value())
-				return m, scanProjectsWithPathCmd(m.pathInput.Value())
+				m.rootScanPath = pathValue
+				m.activeRootFolderID = rootFolder.ID
+				
+				// Save root path to config for backward compatibility
+				_ = db.SetConfig("root_scan_path", pathValue)
+				
+				// Scan with the root folder ID
+				return m, scanRootFolderCmd(rootFolder.ID, pathValue)
 			} else if m.screen == screenSetupGitHub {
 				// User pressed enter to start OAuth flow
 				m.statusMessage = "Initiating GitHub authentication..."
@@ -781,7 +837,7 @@ func (m model) updateSetup(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 
 				// Validate token before saving
-				validationClient, err := engine.NewGistClient(token)
+				validationClient, err := engine.NewGistClient(token, 0) // Use 0 for validation only
 				if err != nil {
 					m.errorMessage = "Failed to create validation client."
 					return m, nil
@@ -1197,6 +1253,193 @@ func (m model) updateCloudSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// updateRootFolderManage handles updates for the root folder management screen
+func (m model) updateRootFolderManage(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		// If adding a new root folder
+		if m.addingRootFolder {
+			switch msg.String() {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "enter":
+				folderPath := m.rootFolderInput.Value()
+				if folderPath == "" {
+					m.errorMessage = "Please enter a valid folder path"
+					return m, nil
+				}
+				
+				// Extract folder name from path
+				folderName := filepath.Base(folderPath)
+				
+				// Create new root folder
+				rootFolder := &models.RootFolder{
+					Name:     folderName,
+					Path:     folderPath,
+					IsActive: len(m.rootFolders) == 0, // Make first folder active
+				}
+				
+				if err := db.AddRootFolder(rootFolder); err != nil {
+					m.errorMessage = fmt.Sprintf("Failed to add root folder: %v", err)
+					return m, nil
+				}
+				
+				// Reload root folders
+				rootFolders, err := db.GetAllRootFolders()
+				if err != nil {
+					m.errorMessage = fmt.Sprintf("Failed to reload root folders: %v", err)
+					return m, nil
+				}
+				m.rootFolders = rootFolders
+				
+				m.addingRootFolder = false
+				m.statusMessage = "Root folder added successfully"
+				m.errorMessage = ""
+				
+				// If this is the only folder, set it as active and update scan path
+				if len(m.rootFolders) == 1 {
+					m.activeRootFolderID = rootFolder.ID
+					m.rootScanPath = rootFolder.Path
+					db.SetConfig("root_scan_path", rootFolder.Path)
+				}
+				
+				return m, nil
+				
+			case "esc":
+				m.addingRootFolder = false
+				m.statusMessage = ""
+				m.errorMessage = ""
+				return m, nil
+				
+			default:
+				var cmd tea.Cmd
+				m.rootFolderInput, cmd = m.rootFolderInput.Update(msg)
+				return m, cmd
+			}
+		}
+		
+		// Normal navigation
+		switch msg.String() {
+		case "ctrl+c", "q":
+			return m, tea.Quit
+			
+		case "esc":
+			// Return to main screen
+			m.screen = screenList
+			m.errorMessage = ""
+			m.statusMessage = ""
+			return m, reloadProjectsCmd()
+			
+		case "up", "k":
+			if m.rootFolderCursor > 0 {
+				m.rootFolderCursor--
+			}
+			m.errorMessage = ""
+			return m, nil
+			
+		case "down", "j":
+			if m.rootFolderCursor < len(m.rootFolders)-1 {
+				m.rootFolderCursor++
+			}
+			m.errorMessage = ""
+			return m, nil
+			
+		case "enter":
+			// Set the selected root folder as active
+			if len(m.rootFolders) == 0 {
+				m.errorMessage = "No root folders available"
+				return m, nil
+			}
+			
+			selectedFolder := m.rootFolders[m.rootFolderCursor]
+			if err := db.SetActiveRootFolder(selectedFolder.ID); err != nil {
+				m.errorMessage = fmt.Sprintf("Failed to set active root folder: %v", err)
+				return m, nil
+			}
+			
+			m.activeRootFolderID = selectedFolder.ID
+			m.rootScanPath = selectedFolder.Path
+			db.SetConfig("root_scan_path", selectedFolder.Path)
+			m.statusMessage = fmt.Sprintf("Switched to: %s", selectedFolder.Name)
+			m.errorMessage = ""
+			
+			// Return to main screen and reload projects
+			m.screen = screenList
+			return m, reloadProjectsCmd()
+			
+		case "a":
+			// Add new root folder
+			m.addingRootFolder = true
+			m.errorMessage = ""
+			m.statusMessage = ""
+			
+			// Create text input for new root folder
+			input := textinput.New()
+			input.Placeholder = "Enter folder path (e.g., D:\\Projects)"
+			input.Focus()
+			input.CharLimit = 256
+			input.Width = 60
+			m.rootFolderInput = input
+			
+			return m, textinput.Blink
+			
+		case "d":
+			// Delete the selected root folder
+			if len(m.rootFolders) == 0 {
+				m.errorMessage = "No root folders to delete"
+				return m, nil
+			}
+			
+			selectedFolder := m.rootFolders[m.rootFolderCursor]
+			
+			// Don't allow deleting the active folder if it's the only one
+			if selectedFolder.IsActive && len(m.rootFolders) == 1 {
+				m.errorMessage = "Cannot delete the only active root folder"
+				return m, nil
+			}
+			
+			if err := db.DeleteRootFolder(selectedFolder.ID); err != nil {
+				m.errorMessage = fmt.Sprintf("Failed to delete root folder: %v", err)
+				return m, nil
+			}
+			
+			// Reload root folders
+			rootFolders, err := db.GetAllRootFolders()
+			if err != nil {
+				m.errorMessage = fmt.Sprintf("Failed to reload root folders: %v", err)
+				return m, nil
+			}
+			m.rootFolders = rootFolders
+			
+			// Adjust cursor if needed
+			if m.rootFolderCursor >= len(m.rootFolders) {
+				m.rootFolderCursor = len(m.rootFolders) - 1
+				if m.rootFolderCursor < 0 {
+					m.rootFolderCursor = 0
+				}
+			}
+			
+			m.statusMessage = "Root folder deleted"
+			m.errorMessage = ""
+			return m, nil
+			
+		case "s":
+			// Scan the selected root folder
+			if len(m.rootFolders) == 0 {
+				m.errorMessage = "No root folders available"
+				return m, nil
+			}
+			
+			selectedFolder := m.rootFolders[m.rootFolderCursor]
+			m.statusMessage = fmt.Sprintf("Scanning %s...", selectedFolder.Name)
+			m.errorMessage = ""
+			return m, scanRootFolderCmd(selectedFolder.ID, selectedFolder.Path)
+		}
+	}
+	
+	return m, nil
+}
+
 // View renders the UI
 func (m model) View() string {
 	if m.screen == screenSetupPath || m.screen == screenSetupGitHub || m.screen == screenSetupToken || m.screen == screenOAuthWaiting {
@@ -1204,6 +1447,9 @@ func (m model) View() string {
 	}
 	if m.screen == screenCloudSelect {
 		return m.viewCloudSelect()
+	}
+	if m.screen == screenRootFolderManage {
+		return m.viewRootFolderManage()
 	}
 	return m.viewList()
 }
@@ -1627,6 +1873,100 @@ func (m model) viewCloudSelect() string {
 	return docStyle.Render(s)
 }
 
+// viewRootFolderManage renders the root folder management screen
+func (m model) viewRootFolderManage() string {
+	// Title box
+	titleBox := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#00FFFF")).
+		Padding(0, 2).
+		Bold(true).
+		Foreground(lipgloss.Color("#00FFFF")).
+		Render("Manage Root Folders")
+
+	s := "\n" + titleBox + "\n\n"
+
+	// If adding a new root folder
+	if m.addingRootFolder {
+		s += lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Render("Enter the path for the new root folder:\n\n")
+		s += m.rootFolderInput.View() + "\n\n"
+		s += lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#888888")).
+			Render("Press Enter to add | ESC to cancel")
+		return docStyle.Render(s)
+	}
+
+	// Display root folders
+	if len(m.rootFolders) == 0 {
+		s += lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFAA00")).
+			Render("No root folders configured. Press 'a' to add one.")
+	} else {
+		for i, folder := range m.rootFolders {
+			style := lipgloss.NewStyle().Padding(0, 2)
+			
+			// Highlight cursor
+			if i == m.rootFolderCursor {
+				style = style.Background(lipgloss.Color("#333333"))
+			}
+			
+			// Format folder entry
+			prefix := "  "
+			if folder.IsActive {
+				prefix = "► " // Active marker
+				style = style.Bold(true).Foreground(lipgloss.Color("#00FF00"))
+			} else {
+				style = style.Foreground(lipgloss.Color("#FFFFFF"))
+			}
+			
+			name := folder.Name
+			path := folder.Path
+			
+			// Show gist sync status
+			gistStatus := ""
+			if folder.GistID != "" {
+				gistStatus = " ☁"
+			}
+			
+			line := fmt.Sprintf("%s%s%s", prefix, name, gistStatus)
+			s += style.Render(line) + "\n"
+			
+			// Show path in gray
+			pathStyle := lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#888888")).
+				Padding(0, 4)
+			if i == m.rootFolderCursor {
+				pathStyle = pathStyle.Background(lipgloss.Color("#333333"))
+			}
+			s += pathStyle.Render(path) + "\n\n"
+		}
+	}
+
+	// Help text
+	helpText := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#888888")).
+		Render("\n\nKeys: ↑↓/jk=navigate  enter=switch  a=add  d=delete  s=scan  esc=back  q=quit")
+	s += helpText
+
+	// Display error message if present
+	if m.errorMessage != "" {
+		errorView := errorStyle.Render(fmt.Sprintf("\n⚠ %s", m.errorMessage))
+		s += errorView
+	}
+
+	// Display status message if present
+	if m.statusMessage != "" {
+		statusView := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#00AA00")).
+			Render("\n✓ " + m.statusMessage)
+		s += statusView
+	}
+
+	return docStyle.Render(s)
+}
+
 // viewList renders the project list screen
 func (m model) viewList() string {
 	// If not ready, show loading state
@@ -1782,12 +2122,12 @@ func (m model) viewList() string {
 		// Token not configured
 		helpText = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#888888")).
-			Render("\n\nKeys: enter=open  o=browser  x=run  s=scan  g=clone  t=github-oauth  c=clear-all  d=archive  r=restore  /=filter  q=quit")
+			Render("\n\nKeys: enter=open  o=browser  x=run  s=scan  g=clone  f=folders  t=github-oauth  c=clear-all  d=archive  r=restore  /=filter  q=quit")
 	} else {
 		// Token configured
 		helpText = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#888888")).
-			Render("\n\nKeys: enter=open  o=browser  x=run  s=scan  g=clone  u=sync-up  l=select-cloud  t=github-oauth  c=clear-all  d=archive  r=restore  /=filter  q=quit")
+			Render("\n\nKeys: enter=open  o=browser  x=run  s=scan  g=clone  f=folders  u=sync-up  l=select-cloud  t=github-oauth  c=clear-all  d=archive  r=restore  /=filter  q=quit")
 	}
 
 	// Build output without extra docStyle wrapping to avoid layout issues
@@ -1854,6 +2194,11 @@ func NewModel() (model, error) {
 			width:                80,
 			height:               24,
 			ready:                false,
+			rootFolders:          nil,
+			rootFolderCursor:     0,
+			activeRootFolderID:   0,
+			rootFolderInput:      textinput.New(),
+			addingRootFolder:     false,
 		}, nil
 	}
 
@@ -1891,6 +2236,11 @@ func NewModel() (model, error) {
 		width:                80,
 		height:               24,
 		ready:                false,
+		rootFolders:          nil,
+		rootFolderCursor:     0,
+		activeRootFolderID:   0,
+		rootFolderInput:      textinput.New(),
+		addingRootFolder:     false,
 	}, nil
 }
 
@@ -2064,6 +2414,58 @@ func detectAndCreateRunCommand(projectPath string) (*exec.Cmd, error) {
 	return nil, fmt.Errorf("unable to detect project type or run command")
 }
 
+// scanRootFolderCmd creates a command that scans a specific root folder
+func scanRootFolderCmd(rootFolderID uint, scanPath string) tea.Cmd {
+	return func() tea.Msg {
+		// Scan for projects at the specified path
+		projects, err := engine.ScanDirectory(scanPath)
+		if err != nil {
+			return ScanCompleteMsg{err: err}
+		}
+
+		// Set the RootFolderID for all scanned projects
+		for i := range projects {
+			projects[i].RootFolderID = rootFolderID
+		}
+
+		// Get existing projects for this root folder only
+		existingProjects, err := db.GetProjectsByRootFolder(rootFolderID)
+		if err != nil {
+			return ScanCompleteMsg{err: err}
+		}
+
+		// Create map of scanned project paths
+		scannedPaths := make(map[string]bool)
+		for _, p := range projects {
+			scannedPaths[p.Path] = true
+		}
+
+		// Remove projects that no longer exist (only active ones)
+		removedCount := 0
+		for _, existing := range existingProjects {
+			if existing.Status == "active" && !scannedPaths[existing.Path] {
+				if err := db.DeleteProject(existing.ID); err == nil {
+					removedCount++
+				}
+			}
+		}
+
+		// Add new projects to database
+		addedCount := 0
+		for i := range projects {
+			if err := db.AddProject(&projects[i]); err == nil {
+				addedCount++
+			}
+		}
+
+		return ScanCompleteMsg{
+			projectsFound:   len(projects),
+			projectsAdded:   addedCount,
+			projectsRemoved: removedCount,
+		}
+	}
+}
+
 // scanProjectsWithPathCmd creates a command that scans for projects at a specific path
 func scanProjectsWithPathCmd(scanPath string) tea.Cmd {
 	return func() tea.Msg {
@@ -2073,7 +2475,19 @@ func scanProjectsWithPathCmd(scanPath string) tea.Cmd {
 			return ScanCompleteMsg{err: err}
 		}
 
-		// Get existing projects from database
+		// Get active root folder to set RootFolderID for scanned projects
+		var rootFolderID uint
+		activeRoot, err := db.GetActiveRootFolder()
+		if err == nil && activeRoot != nil {
+			rootFolderID = activeRoot.ID
+		}
+		
+		// Set the RootFolderID for all scanned projects
+		for i := range projects {
+			projects[i].RootFolderID = rootFolderID
+		}
+
+		// Get existing projects from database (filtered by active root folder)
 		existingProjects, err := db.GetProjects()
 		if err != nil {
 			return ScanCompleteMsg{err: err}
@@ -2202,8 +2616,15 @@ func syncToCloudCmd() tea.Cmd {
 			return SyncToCloudMsg{err: fmt.Errorf("GitHub authentication required. Please authenticate with OAuth (press 't')")}
 		}
 
-		// Create gist client (loads existing gist ID automatically)
-		client, err := engine.NewGistClient(token)
+		// Get active root folder ID
+		var rootFolderID uint
+		activeRoot, err := db.GetActiveRootFolder()
+		if err == nil && activeRoot != nil {
+			rootFolderID = activeRoot.ID
+		}
+
+		// Create gist client with root folder ID (loads existing gist ID automatically)
+		client, err := engine.NewGistClient(token, rootFolderID)
 		if err != nil {
 			return SyncToCloudMsg{err: fmt.Errorf("failed to create gist client: %w", err)}
 		}
@@ -2213,7 +2634,7 @@ func syncToCloudCmd() tea.Cmd {
 			return SyncToCloudMsg{err: fmt.Errorf("invalid GitHub token. Please reconfigure your token (press 't')")}
 		}
 
-		// Get all projects
+		// Get all projects (filtered by active root folder)
 		projects, err := db.GetProjects()
 		if err != nil {
 			return SyncToCloudMsg{err: fmt.Errorf("failed to get projects: %w", err)}
@@ -2238,8 +2659,15 @@ func loadFromCloudCmd() tea.Cmd {
 			return LoadFromCloudMsg{err: fmt.Errorf("GitHub authentication required. Please authenticate with OAuth (press 't')")}
 		}
 
-		// Create gist client (loads existing gist ID automatically)
-		client, err := engine.NewGistClient(token)
+		// Get active root folder ID
+		var rootFolderID uint
+		activeRoot, err := db.GetActiveRootFolder()
+		if err == nil && activeRoot != nil {
+			rootFolderID = activeRoot.ID
+		}
+
+		// Create gist client with root folder ID (loads existing gist ID automatically)
+		client, err := engine.NewGistClient(token, rootFolderID)
 		if err != nil {
 			return LoadFromCloudMsg{err: fmt.Errorf("failed to create gist client: %w", err)}
 		}
@@ -2253,6 +2681,11 @@ func loadFromCloudCmd() tea.Cmd {
 		projects, err := client.LoadFromGist()
 		if err != nil {
 			return LoadFromCloudMsg{err: err}
+		}
+
+		// Set RootFolderID for all loaded projects
+		for i := range projects {
+			projects[i].RootFolderID = rootFolderID
 		}
 
 		// Clear existing projects
@@ -2281,8 +2714,15 @@ func listCloudProjectsCmd() tea.Cmd {
 			return ListCloudProjectsMsg{err: fmt.Errorf("GitHub authentication required. Please authenticate with OAuth (press 't')")}
 		}
 
-		// Create gist client (loads existing gist ID automatically)
-		client, err := engine.NewGistClient(token)
+		// Get active root folder ID
+		var rootFolderID uint
+		activeRoot, err := db.GetActiveRootFolder()
+		if err == nil && activeRoot != nil {
+			rootFolderID = activeRoot.ID
+		}
+
+		// Create gist client with root folder ID (loads existing gist ID automatically)
+		client, err := engine.NewGistClient(token, rootFolderID)
 		if err != nil {
 			return ListCloudProjectsMsg{err: fmt.Errorf("failed to create gist client: %w", err)}
 		}
@@ -2307,6 +2747,13 @@ func loadSelectedProjectsCmd(selectedIndices []int, cloudProjects []models.Proje
 	return func() tea.Msg {
 		loadedCount := 0
 
+		// Get active root folder ID
+		var rootFolderID uint
+		activeRoot, err := db.GetActiveRootFolder()
+		if err == nil && activeRoot != nil {
+			rootFolderID = activeRoot.ID
+		}
+
 		for _, idx := range selectedIndices {
 			if idx < 0 || idx >= len(cloudProjects) {
 				continue
@@ -2316,6 +2763,7 @@ func loadSelectedProjectsCmd(selectedIndices []int, cloudProjects []models.Proje
 			// Reset ID for new insertion and mark as archived
 			project.ID = 0
 			project.Status = "archived"
+			project.RootFolderID = rootFolderID // Set to active root folder
 
 			// Check if project already exists
 			if existing, err := db.GetProjectByPath(project.Path); err == nil {
