@@ -28,14 +28,21 @@
 
 ### Quick Install (Recommended)
 
+#### Windows
+**Option 1: Windows Installer (Easiest - Auto-adds to PATH)**
+1. Download `devbase-windows-installer.exe` from [latest release](https://github.com/maleesha-pramud/devbase/releases)
+2. Run the installer
+3. Restart your terminal
+4. Done! Use `devbase` command from anywhere
+
+**Option 2: PowerShell Script**
+```powershell
+iwr -useb https://raw.githubusercontent.com/maleesha-pramud/devbase/main/install.ps1 | iex
+```
+
 #### Linux / macOS
 ```bash
 curl -fsSL https://raw.githubusercontent.com/maleesha-pramud/devbase/main/install.sh | bash
-```
-
-#### Windows (PowerShell - Run as Administrator)
-```powershell
-iwr -useb https://raw.githubusercontent.com/maleesha-pramud/devbase/main/install.ps1 | iex
 ```
 
 ### Alternative Installation Methods
@@ -81,12 +88,14 @@ sudo rm /usr/local/bin/devbase        # Remove binary
 rm ~/devbase.db                        # Remove database (optional)
 ```
 
-#### Windows
-```powershell
-Remove-Item -Path "$env:LOCALAPPDATA\Programs\DevBase" -Recurse -Force  # Remove binary
-Remove-Item -Path "$env:USERPROFILE\devbase.db"                        # Remove database (optional)
-# Manually remove from PATH: Settings → System → About → Advanced system settings → Environment Variables
-```
+**Windows:**
+- **Installer:** Run the uninstaller from "Add or Remove Programs" or `devbase-windows-installer.exe` (uninstall option)
+- **Manual:** 
+  ```powershell
+  Remove-Item -Path "$env:LOCALAPPDATA\Programs\DevBase" -Recurse -Force  # Remove binary
+  Remove-Item -Path "$env:USERPROFILE\devbase.db"                        # Remove database (optional)
+  # If installed via installer, PATH is auto-removed. Otherwise manually remove from PATH.
+  ```
 
 ### If installed via Go
 ```bash

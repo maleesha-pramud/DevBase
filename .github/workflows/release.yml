@@ -158,3 +158,71 @@ jobs:
           asset_path: ./${{ matrix.archive }}.sha256
           asset_name: ${{ matrix.archive }}.sha256
           asset_content_type: text/plain
+
+  build-windows-installer:
+    name: Build Windows Installer
+    needs: create-release
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+
+      - name: Build Windows binary (amd64)
+        env:
+          GOOS: windows
+          GOARCH: amd64
+        run: |
+          go build -v -ldflags="-s -w -X 'main.Version=${{ needs.create-release.outputs.version }}'" -o devbase.exe ./cmd/devbase
+
+      - name: Install Inno Setup
+        run: |
+          choco install innosetup -y
+
+      - name: Update version in Inno Setup script
+        run: |
+          $content = Get-Content installer/devbase.iss -Raw
+          $content = $content -replace '#define MyAppVersion ".*"', '#define MyAppVersion "${{ needs.create-release.outputs.version }}"'
+          Set-Content installer/devbase.iss -Value $content
+        shell: pwsh
+
+      - name: Create assets directory if missing
+        run: |
+          if (-not (Test-Path "assets")) { New-Item -ItemType Directory -Path "assets" }
+        shell: pwsh
+
+      - name: Create placeholder icon if missing
+        run: |
+          if (-not (Test-Path "assets/icon.ico")) {
+            # Create empty file as placeholder
+            New-Item -ItemType File -Path "assets/icon.ico" -Force
+          }
+        shell: pwsh
+
+      - name: Create LICENSE if missing
+        run: |
+          if (-not (Test-Path "LICENSE")) {
+            "MIT License - See repository for details" | Out-File -FilePath LICENSE -Encoding utf8
+          }
+        shell: pwsh
+
+      - name: Build installer with Inno Setup
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer/devbase.iss
+        shell: pwsh
+
+      - name: Upload Windows Installer
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./dist/devbase-windows-installer.exe
+          asset_name: devbase-windows-installer.exe
+          asset_content_type: application/octet-stream
