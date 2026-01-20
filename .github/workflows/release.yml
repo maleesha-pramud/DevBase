@@ -1,0 +1,160 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'  # Trigger on version tags (e.g., v1.0.0, v1.7.15)
+  workflow_dispatch:  # Allow manual trigger
+
+permissions:
+  contents: write  # Required for creating releases
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      version: ${{ steps.get_version.outputs.version }}
+    steps:
+      - name: Get version from tag
+        id: get_version
+        run: echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: DevBase ${{ steps.get_version.outputs.version }}
+          draft: false
+          prerelease: false
+          body: |
+            ## DevBase ${{ steps.get_version.outputs.version }}
+            
+            ### Installation
+            
+            #### Quick Install
+            
+            **Linux/macOS:**
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/maleesha-pramud/devbase/main/install.sh | bash
+            ```
+            
+            **Windows (PowerShell):**
+            ```powershell
+            iwr -useb https://raw.githubusercontent.com/maleesha-pramud/devbase/main/install.ps1 | iex
+            ```
+            
+            #### Manual Install
+            
+            Download the appropriate binary for your platform below, extract it, and place it in your PATH.
+            
+            ### Changes
+            
+            See [CHANGELOG.md](https://github.com/maleesha-pramud/devbase/blob/main/CHANGELOG.md) for details.
+
+  build-and-upload:
+    name: Build and Upload
+    needs: create-release
+    strategy:
+      matrix:
+        include:
+          # Linux builds
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            output: devbase
+            archive: devbase-linux-amd64.tar.gz
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            output: devbase
+            archive: devbase-linux-arm64.tar.gz
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm
+            goarm: 7
+            output: devbase
+            archive: devbase-linux-armv7.tar.gz
+          
+          # macOS builds
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
+            output: devbase
+            archive: devbase-darwin-amd64.tar.gz
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            output: devbase
+            archive: devbase-darwin-arm64.tar.gz
+          
+          # Windows builds
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            output: devbase.exe
+            archive: devbase-windows-amd64.zip
+          - os: windows-latest
+            goos: windows
+            goarch: arm64
+            output: devbase.exe
+            archive: devbase-windows-arm64.zip
+
+    runs-on: ${{ matrix.os }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'  # Adjust to your Go version
+          cache: true
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          go build -v -ldflags="-s -w -X 'main.Version=${{ needs.create-release.outputs.version }}'" -o ${{ matrix.output }} ./cmd/devbase
+
+      - name: Create archive (Linux/macOS)
+        if: matrix.goos != 'windows'
+        run: tar -czf ${{ matrix.archive }} ${{ matrix.output }}
+
+      - name: Create archive (Windows)
+        if: matrix.goos == 'windows'
+        run: Compress-Archive -Path ${{ matrix.output }} -DestinationPath ${{ matrix.archive }}
+        shell: pwsh
+
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./${{ matrix.archive }}
+          asset_name: ${{ matrix.archive }}
+          asset_content_type: application/octet-stream
+
+      - name: Generate checksums
+        if: matrix.os == 'ubuntu-latest' && matrix.goarch == 'amd64'
+        run: |
+          sha256sum ${{ matrix.archive }} > ${{ matrix.archive }}.sha256
+
+      - name: Upload checksum
+        if: matrix.os == 'ubuntu-latest' && matrix.goarch == 'amd64'
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./${{ matrix.archive }}.sha256
+          asset_name: ${{ matrix.archive }}.sha256
+          asset_content_type: text/plain

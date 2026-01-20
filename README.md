@@ -26,22 +26,73 @@
 
 ## 📦 Installation
 
-### Option 1: Install with Go (Recommended)
+### Quick Install (Recommended)
+
+#### Linux / macOS
+```bash
+curl -fsSL https://raw.githubusercontent.com/maleesha-pramud/devbase/main/install.sh | bash
+```
+
+#### Windows (PowerShell - Run as Administrator)
+```powershell
+iwr -useb https://raw.githubusercontent.com/maleesha-pramud/devbase/main/install.ps1 | iex
+```
+
+### Alternative Installation Methods
+
+#### Install with Go
 ```bash
 go install github.com/maleesha-pramud/devbase/cmd/devbase@latest
 ```
 
-### Option 2: Build from Source
+#### Manual Installation from Releases
+
+1. Download the latest release for your platform from [GitHub Releases](https://github.com/maleesha-pramud/devbase/releases)
+2. Extract the archive:
+
+**Linux/macOS:**
+```bash
+tar -xzf devbase-*.tar.gz
+sudo mv devbase /usr/local/bin/
+```
+
+**Windows:**
+- Extract `devbase-windows-amd64.zip`
+- Move `devbase.exe` to a folder in your PATH (e.g., `C:\Program Files\DevBase\`)
+- Add the folder to your System PATH
+
+#### Build from Source
 ```bash
 git clone https://github.com/maleesha-pramud/devbase
 cd devbase
-go install ./cmd/devbase
+go build -o devbase ./cmd/devbase
+# Move binary to your PATH
 ```
 
-### Option 3: Use Pre-built Binary
-Download `DevBase.exe` and place it in your PATH.
-
 **Note:** DevBase stores its database file (`devbase.db`) in your home directory (`~/devbase.db` on Unix-like systems, `%USERPROFILE%\devbase.db` on Windows). This allows you to run the `devbase` command from any directory.
+
+## 🗑️ Uninstallation
+
+### Quick Uninstall
+
+#### Linux/macOS
+```bash
+sudo rm /usr/local/bin/devbase        # Remove binary
+rm ~/devbase.db                        # Remove database (optional)
+```
+
+#### Windows
+```powershell
+Remove-Item -Path "$env:LOCALAPPDATA\Programs\DevBase" -Recurse -Force  # Remove binary
+Remove-Item -Path "$env:USERPROFILE\devbase.db"                        # Remove database (optional)
+# Manually remove from PATH: Settings → System → About → Advanced system settings → Environment Variables
+```
+
+### If installed via Go
+```bash
+rm $(which devbase)     # Linux/macOS
+rm ~/devbase.db         # Remove database (optional)
+```
 
 ## 🎮 Usage
 
