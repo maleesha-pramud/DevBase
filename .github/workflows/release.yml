@@ -192,19 +192,6 @@ jobs:
           Set-Content installer/devbase.iss -Value $content
         shell: pwsh
 
-      - name: Create assets directory if missing
-        run: |
-          if (-not (Test-Path "assets")) { New-Item -ItemType Directory -Path "assets" }
-        shell: pwsh
-
-      - name: Create placeholder icon if missing
-        run: |
-          if (-not (Test-Path "assets/icon.ico")) {
-            # Create empty file as placeholder
-            New-Item -ItemType File -Path "assets/icon.ico" -Force
-          }
-        shell: pwsh
-
       - name: Create LICENSE if missing
         run: |
           if (-not (Test-Path "LICENSE")) {

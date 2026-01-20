@@ -19,3 +19,8 @@ One-line install:
   
   # Windows
   iwr -useb https://raw.githubusercontent.com/maleesha-pramud/devbase/main/install.ps1 | iex
+
+
+If you want to add a custom icon later, you can:
+  Create/add an assets/icon.ico file
+  Uncomment the two icon-related lines in the .iss file

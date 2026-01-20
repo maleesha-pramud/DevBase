@@ -22,14 +22,15 @@ AllowNoIcons=yes
 LicenseFile=..\LICENSE
 OutputDir=..\dist
 OutputBaseFilename=devbase-windows-installer
-SetupIconFile=..\assets\icon.ico
+; SetupIconFile is optional - comment out if icon doesn't exist
+; SetupIconFile=..\assets\icon.ico
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 ChangesEnvironment=yes
-UninstallDisplayIcon={app}\{#MyAppExeName}
+; UninstallDisplayIcon={app}\{#MyAppExeName}
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
