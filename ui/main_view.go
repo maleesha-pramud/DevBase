@@ -182,6 +182,7 @@ const (
 	screenOAuthWaiting
 	screenCloudSelect
 	screenRootFolderManage
+	screenRepoSelect
 	screenList
 )
 
@@ -190,6 +191,12 @@ type CloneMsg struct {
 	projectName string
 	projectPath string
 	err         error
+}
+
+// FetchReposMsg is sent when fetching user repositories completes
+type FetchReposMsg struct {
+	repos []engine.GitHubRepository
+	err   error
 }
 
 // model represents the Bubble Tea application model
@@ -208,6 +215,11 @@ type model struct {
 	archiveIdx           int
 	confirmClone         bool
 	cloneInput           textinput.Model
+	cloneMode            string // "url" or "select"
+	userRepos            []engine.GitHubRepository
+	repoFilterInput      textinput.Model
+	repoCursorIndex      int
+	repoFiltering        bool
 	cloudProjects        []models.Project
 	selectedCloudIndices []int
 	cloudCursorIndex     int
@@ -223,11 +235,11 @@ type model struct {
 	oauthVerificationURI string
 	oauthInterval        int
 	// Root folder management fields
-	rootFolders          []models.RootFolder
-	rootFolderCursor     int
-	activeRootFolderID   uint
-	rootFolderInput      textinput.Model
-	addingRootFolder     bool
+	rootFolders        []models.RootFolder
+	rootFolderCursor   int
+	activeRootFolderID uint
+	rootFolderInput    textinput.Model
+	addingRootFolder   bool
 }
 
 // Init initializes the model and loads projects from the database
@@ -263,24 +275,41 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.screen == screenCloudSelect {
 		return m.updateCloudSelect(msg)
 	}
-	
+
 	// Handle root folder management screen
 	if m.screen == screenRootFolderManage {
 		return m.updateRootFolderManage(msg)
 	}
 
+	// Handle repository selection screen
+	if m.screen == screenRepoSelect {
+		return m.updateRepoSelect(msg)
+	}
+
 	// Handle list screen
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		// If in clone input mode, only handle enter and esc
+		// If in clone input mode, only handle enter, esc, and 'b' for browse
 		if m.confirmClone {
 			switch msg.String() {
 			case "ctrl+c":
 				return m, tea.Quit
+			case "b":
+				// Switch to browse mode
+				// Check if GitHub token is configured
+				token, err := db.GetConfig("github_token")
+				if err != nil || token == "" {
+					m.errorMessage = "GitHub authentication required. Press 't' to authenticate with OAuth."
+					return m, nil
+				}
+				m.confirmClone = false
+				m.statusMessage = "Loading your GitHub repositories..."
+				m.errorMessage = ""
+				return m, fetchUserReposCmd()
 			case "enter":
 				repoURL := m.cloneInput.Value()
 				if repoURL == "" {
-					m.errorMessage = "Please enter a valid GitHub repository URL"
+					m.errorMessage = "Please enter a valid GitHub repository URL or press 'b' to browse"
 					return m, nil
 				}
 				// Clear confirmation state
@@ -459,20 +488,37 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.errorMessage = "No scan path configured. Please restart."
 				return m, nil
 			}
-			// Enter clone mode
+			// Enter clone mode with URL input
 			m.confirmClone = true
+			m.cloneMode = "url"
 			m.errorMessage = ""
-			m.statusMessage = ""
+			m.statusMessage = "Enter repository URL or press 'b' to browse your repositories"
 
 			// Create clone input
 			cloneInput := textinput.New()
-			cloneInput.Placeholder = "https://github.com/owner/repo"
+			cloneInput.Placeholder = "https://github.com/owner/repo or press 'b' to browse"
 			cloneInput.Focus()
 			cloneInput.CharLimit = 256
 			cloneInput.Width = 60
 			m.cloneInput = cloneInput
 
 			return m, textinput.Blink
+
+		case "b":
+			// Browse GitHub repositories (shortcut from main screen)
+			if m.rootScanPath == "" {
+				m.errorMessage = "No scan path configured. Please restart."
+				return m, nil
+			}
+			// Check if GitHub token is configured
+			token, err := db.GetConfig("github_token")
+			if err != nil || token == "" {
+				m.errorMessage = "GitHub authentication required. Press 't' to authenticate with OAuth."
+				return m, nil
+			}
+			m.statusMessage = "Loading your GitHub repositories..."
+			m.errorMessage = ""
+			return m, fetchUserReposCmd()
 
 		case "o":
 			// Open GitHub repository URL in default browser
@@ -556,14 +602,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.errorMessage = ""
 			m.statusMessage = ""
 			return m, nil
-		
+
 		case "f":
 			// Manage root folders
 			m.screen = screenRootFolderManage
 			m.errorMessage = ""
 			m.statusMessage = ""
 			m.addingRootFolder = false
-			
+
 			// Load root folders
 			rootFolders, err := db.GetAllRootFolders()
 			if err != nil {
@@ -572,13 +618,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.rootFolders = rootFolders
 			m.rootFolderCursor = 0
-			
+
 			// Get active root folder ID
 			activeRoot, err := db.GetActiveRootFolder()
 			if err == nil {
 				m.activeRootFolderID = activeRoot.ID
 			}
-			
+
 			return m, nil
 
 		case "esc":
@@ -772,6 +818,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Reload the list to show the new archived projects
 		return m, reloadProjectsCmd()
 
+	case FetchReposMsg:
+		// Handle fetch user repositories completion
+		if msg.err != nil {
+			m.errorMessage = fmt.Sprintf("Failed to fetch repositories: %v", msg.err)
+			m.statusMessage = ""
+			return m, nil
+		}
+		m.userRepos = msg.repos
+		m.repoCursorIndex = 0
+		m.repoFiltering = false
+		m.screen = screenRepoSelect
+		m.statusMessage = ""
+		m.errorMessage = ""
+
+		// Initialize filter input
+		filterInput := textinput.New()
+		filterInput.Placeholder = "Type to filter repositories..."
+		filterInput.CharLimit = 100
+		filterInput.Width = 50
+		m.repoFilterInput = filterInput
+
+		return m, nil
+
 	case ErrorMsg:
 		m.errorMessage = msg.err.Error()
 		return m, nil
@@ -796,31 +865,31 @@ func (m model) updateSetup(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.errorMessage = "Please enter a valid path"
 					return m, nil
 				}
-				
+
 				pathValue := m.pathInput.Value()
 				folderName := filepath.Base(pathValue)
-				
+
 				// Create a root folder for this path
 				rootFolder := &models.RootFolder{
 					Name:     folderName,
 					Path:     pathValue,
 					IsActive: true, // First folder is active by default
 				}
-				
+
 				if err := db.AddRootFolder(rootFolder); err != nil {
 					m.errorMessage = fmt.Sprintf("Failed to create root folder: %v", err)
 					return m, nil
 				}
-				
+
 				m.isScanning = true
 				m.statusMessage = "Scanning for projects..."
 				m.errorMessage = ""
 				m.rootScanPath = pathValue
 				m.activeRootFolderID = rootFolder.ID
-				
+
 				// Save root path to config for backward compatibility
 				_ = db.SetConfig("root_scan_path", pathValue)
-				
+
 				// Scan with the root folder ID
 				return m, scanRootFolderCmd(rootFolder.ID, pathValue)
 			} else if m.screen == screenSetupGitHub {
@@ -1253,6 +1322,267 @@ func (m model) updateCloudSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// updateRepoSelect handles updates for the GitHub repository selection screen
+func (m model) updateRepoSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		// Handle filter input when filtering mode is active
+		if m.repoFiltering {
+			switch msg.String() {
+			case "esc":
+				// Exit filter mode
+				m.repoFiltering = false
+				m.repoFilterInput.Blur()
+				m.repoFilterInput.SetValue("")
+				m.repoCursorIndex = 0
+				m.errorMessage = ""
+				return m, nil
+			case "enter":
+				// Exit filter mode and keep the filter
+				m.repoFiltering = false
+				m.repoFilterInput.Blur()
+				m.repoCursorIndex = 0
+				m.errorMessage = ""
+				return m, nil
+			default:
+				// Update filter input
+				var cmd tea.Cmd
+				m.repoFilterInput, cmd = m.repoFilterInput.Update(msg)
+				// Reset cursor when filter changes
+				m.repoCursorIndex = 0
+				m.errorMessage = ""
+				return m, cmd
+			}
+		}
+
+		switch msg.String() {
+		case "ctrl+c", "q", "esc":
+			// Cancel and go back to list screen
+			m.screen = screenList
+			m.userRepos = nil
+			m.repoCursorIndex = 0
+			m.repoFiltering = false
+			m.repoFilterInput.SetValue("")
+			m.statusMessage = "Repository selection cancelled"
+			return m, nil
+
+		case "enter":
+			// Clone selected repository
+			filteredRepos := m.getFilteredRepos()
+			if len(filteredRepos) == 0 {
+				m.errorMessage = "No repositories match the filter"
+				return m, nil
+			}
+
+			// Find the selected repo
+			if m.repoCursorIndex < 0 || m.repoCursorIndex >= len(m.userRepos) {
+				m.errorMessage = "Invalid repository selection"
+				return m, nil
+			}
+
+			selectedRepo := m.userRepos[m.repoCursorIndex]
+
+			// Switch back to list screen and start cloning
+			m.screen = screenList
+			m.userRepos = nil
+			m.repoCursorIndex = 0
+			m.repoFiltering = false
+			m.repoFilterInput.SetValue("")
+			m.statusMessage = fmt.Sprintf("Cloning %s...", selectedRepo.FullName)
+			m.errorMessage = ""
+
+			return m, cloneProjectCmd(selectedRepo.CloneURL, m.rootScanPath)
+
+		case "/":
+			// Enter filter mode
+			m.repoFiltering = true
+			m.repoFilterInput.Focus()
+			m.errorMessage = ""
+			return m, textinput.Blink
+
+		case "up", "k":
+			// Move cursor up in filtered list
+			filteredRepos := m.getFilteredRepos()
+			if len(filteredRepos) == 0 {
+				return m, nil
+			}
+
+			// Find current position
+			currentPos := -1
+			for i := 0; i < len(m.userRepos); i++ {
+				if i == m.repoCursorIndex {
+					// Check if this repo is in filtered list
+					for j, repo := range filteredRepos {
+						if repo.ID == m.userRepos[i].ID {
+							currentPos = j
+							break
+						}
+					}
+					break
+				}
+			}
+
+			// Move up
+			if currentPos > 0 {
+				// Find the index in userRepos
+				for i := 0; i < len(m.userRepos); i++ {
+					if m.userRepos[i].ID == filteredRepos[currentPos-1].ID {
+						m.repoCursorIndex = i
+						break
+					}
+				}
+			} else if currentPos == -1 && len(filteredRepos) > 0 {
+				// Move to last filtered item
+				for i := 0; i < len(m.userRepos); i++ {
+					if m.userRepos[i].ID == filteredRepos[len(filteredRepos)-1].ID {
+						m.repoCursorIndex = i
+						break
+					}
+				}
+			}
+			m.errorMessage = ""
+			return m, nil
+
+		case "down", "j":
+			// Move cursor down in filtered list
+			filteredRepos := m.getFilteredRepos()
+			if len(filteredRepos) == 0 {
+				return m, nil
+			}
+
+			// Find current position
+			currentPos := -1
+			for i := 0; i < len(m.userRepos); i++ {
+				if i == m.repoCursorIndex {
+					// Check if this repo is in filtered list
+					for j, repo := range filteredRepos {
+						if repo.ID == m.userRepos[i].ID {
+							currentPos = j
+							break
+						}
+					}
+					break
+				}
+			}
+
+			// Move down
+			if currentPos >= 0 && currentPos < len(filteredRepos)-1 {
+				// Find the index in userRepos
+				for i := 0; i < len(m.userRepos); i++ {
+					if m.userRepos[i].ID == filteredRepos[currentPos+1].ID {
+						m.repoCursorIndex = i
+						break
+					}
+				}
+			} else if currentPos == -1 && len(filteredRepos) > 0 {
+				// Move to first filtered item
+				for i := 0; i < len(m.userRepos); i++ {
+					if m.userRepos[i].ID == filteredRepos[0].ID {
+						m.repoCursorIndex = i
+						break
+					}
+				}
+			}
+			m.errorMessage = ""
+			return m, nil
+
+		case "pgup":
+			// Jump up by 10 items
+			filteredRepos := m.getFilteredRepos()
+			if len(filteredRepos) == 0 {
+				return m, nil
+			}
+
+			currentPos := -1
+			for i := 0; i < len(m.userRepos); i++ {
+				if i == m.repoCursorIndex {
+					for j, repo := range filteredRepos {
+						if repo.ID == m.userRepos[i].ID {
+							currentPos = j
+							break
+						}
+					}
+					break
+				}
+			}
+
+			if currentPos >= 0 {
+				newPos := max(0, currentPos-10)
+				for i := 0; i < len(m.userRepos); i++ {
+					if m.userRepos[i].ID == filteredRepos[newPos].ID {
+						m.repoCursorIndex = i
+						break
+					}
+				}
+			}
+			m.errorMessage = ""
+			return m, nil
+
+		case "pgdown":
+			// Jump down by 10 items
+			filteredRepos := m.getFilteredRepos()
+			if len(filteredRepos) == 0 {
+				return m, nil
+			}
+
+			currentPos := -1
+			for i := 0; i < len(m.userRepos); i++ {
+				if i == m.repoCursorIndex {
+					for j, repo := range filteredRepos {
+						if repo.ID == m.userRepos[i].ID {
+							currentPos = j
+							break
+						}
+					}
+					break
+				}
+			}
+
+			if currentPos >= 0 {
+				newPos := min(len(filteredRepos)-1, currentPos+10)
+				for i := 0; i < len(m.userRepos); i++ {
+					if m.userRepos[i].ID == filteredRepos[newPos].ID {
+						m.repoCursorIndex = i
+						break
+					}
+				}
+			}
+			m.errorMessage = ""
+			return m, nil
+
+		case "home", "g":
+			// Jump to first item
+			filteredRepos := m.getFilteredRepos()
+			if len(filteredRepos) > 0 {
+				for i := 0; i < len(m.userRepos); i++ {
+					if m.userRepos[i].ID == filteredRepos[0].ID {
+						m.repoCursorIndex = i
+						break
+					}
+				}
+			}
+			m.errorMessage = ""
+			return m, nil
+
+		case "end", "G":
+			// Jump to last item
+			filteredRepos := m.getFilteredRepos()
+			if len(filteredRepos) > 0 {
+				for i := 0; i < len(m.userRepos); i++ {
+					if m.userRepos[i].ID == filteredRepos[len(filteredRepos)-1].ID {
+						m.repoCursorIndex = i
+						break
+					}
+				}
+			}
+			m.errorMessage = ""
+			return m, nil
+		}
+	}
+
+	return m, nil
+}
+
 // updateRootFolderManage handles updates for the root folder management screen
 func (m model) updateRootFolderManage(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -1268,22 +1598,22 @@ func (m model) updateRootFolderManage(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.errorMessage = "Please enter a valid folder path"
 					return m, nil
 				}
-				
+
 				// Extract folder name from path
 				folderName := filepath.Base(folderPath)
-				
+
 				// Create new root folder
 				rootFolder := &models.RootFolder{
 					Name:     folderName,
 					Path:     folderPath,
 					IsActive: len(m.rootFolders) == 0, // Make first folder active
 				}
-				
+
 				if err := db.AddRootFolder(rootFolder); err != nil {
 					m.errorMessage = fmt.Sprintf("Failed to add root folder: %v", err)
 					return m, nil
 				}
-				
+
 				// Reload root folders
 				rootFolders, err := db.GetAllRootFolders()
 				if err != nil {
@@ -1291,88 +1621,88 @@ func (m model) updateRootFolderManage(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				m.rootFolders = rootFolders
-				
+
 				m.addingRootFolder = false
 				m.statusMessage = "Root folder added successfully"
 				m.errorMessage = ""
-				
+
 				// If this is the only folder, set it as active and update scan path
 				if len(m.rootFolders) == 1 {
 					m.activeRootFolderID = rootFolder.ID
 					m.rootScanPath = rootFolder.Path
 					db.SetConfig("root_scan_path", rootFolder.Path)
 				}
-				
+
 				return m, nil
-				
+
 			case "esc":
 				m.addingRootFolder = false
 				m.statusMessage = ""
 				m.errorMessage = ""
 				return m, nil
-				
+
 			default:
 				var cmd tea.Cmd
 				m.rootFolderInput, cmd = m.rootFolderInput.Update(msg)
 				return m, cmd
 			}
 		}
-		
+
 		// Normal navigation
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
-			
+
 		case "esc":
 			// Return to main screen
 			m.screen = screenList
 			m.errorMessage = ""
 			m.statusMessage = ""
 			return m, reloadProjectsCmd()
-			
+
 		case "up", "k":
 			if m.rootFolderCursor > 0 {
 				m.rootFolderCursor--
 			}
 			m.errorMessage = ""
 			return m, nil
-			
+
 		case "down", "j":
 			if m.rootFolderCursor < len(m.rootFolders)-1 {
 				m.rootFolderCursor++
 			}
 			m.errorMessage = ""
 			return m, nil
-			
+
 		case "enter":
 			// Set the selected root folder as active
 			if len(m.rootFolders) == 0 {
 				m.errorMessage = "No root folders available"
 				return m, nil
 			}
-			
+
 			selectedFolder := m.rootFolders[m.rootFolderCursor]
 			if err := db.SetActiveRootFolder(selectedFolder.ID); err != nil {
 				m.errorMessage = fmt.Sprintf("Failed to set active root folder: %v", err)
 				return m, nil
 			}
-			
+
 			m.activeRootFolderID = selectedFolder.ID
 			m.rootScanPath = selectedFolder.Path
 			db.SetConfig("root_scan_path", selectedFolder.Path)
 			m.statusMessage = fmt.Sprintf("Switched to: %s", selectedFolder.Name)
 			m.errorMessage = ""
-			
+
 			// Return to main screen and reload projects
 			m.screen = screenList
 			return m, reloadProjectsCmd()
-			
+
 		case "a":
 			// Add new root folder
 			m.addingRootFolder = true
 			m.errorMessage = ""
 			m.statusMessage = ""
-			
+
 			// Create text input for new root folder
 			input := textinput.New()
 			input.Placeholder = "Enter folder path (e.g., D:\\Projects)"
@@ -1380,29 +1710,29 @@ func (m model) updateRootFolderManage(msg tea.Msg) (tea.Model, tea.Cmd) {
 			input.CharLimit = 256
 			input.Width = 60
 			m.rootFolderInput = input
-			
+
 			return m, textinput.Blink
-			
+
 		case "d":
 			// Delete the selected root folder
 			if len(m.rootFolders) == 0 {
 				m.errorMessage = "No root folders to delete"
 				return m, nil
 			}
-			
+
 			selectedFolder := m.rootFolders[m.rootFolderCursor]
-			
+
 			// Don't allow deleting the active folder if it's the only one
 			if selectedFolder.IsActive && len(m.rootFolders) == 1 {
 				m.errorMessage = "Cannot delete the only active root folder"
 				return m, nil
 			}
-			
+
 			if err := db.DeleteRootFolder(selectedFolder.ID); err != nil {
 				m.errorMessage = fmt.Sprintf("Failed to delete root folder: %v", err)
 				return m, nil
 			}
-			
+
 			// Reload root folders
 			rootFolders, err := db.GetAllRootFolders()
 			if err != nil {
@@ -1410,7 +1740,7 @@ func (m model) updateRootFolderManage(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.rootFolders = rootFolders
-			
+
 			// Adjust cursor if needed
 			if m.rootFolderCursor >= len(m.rootFolders) {
 				m.rootFolderCursor = len(m.rootFolders) - 1
@@ -1418,25 +1748,25 @@ func (m model) updateRootFolderManage(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.rootFolderCursor = 0
 				}
 			}
-			
+
 			m.statusMessage = "Root folder deleted"
 			m.errorMessage = ""
 			return m, nil
-			
+
 		case "s":
 			// Scan the selected root folder
 			if len(m.rootFolders) == 0 {
 				m.errorMessage = "No root folders available"
 				return m, nil
 			}
-			
+
 			selectedFolder := m.rootFolders[m.rootFolderCursor]
 			m.statusMessage = fmt.Sprintf("Scanning %s...", selectedFolder.Name)
 			m.errorMessage = ""
 			return m, scanRootFolderCmd(selectedFolder.ID, selectedFolder.Path)
 		}
 	}
-	
+
 	return m, nil
 }
 
@@ -1450,6 +1780,9 @@ func (m model) View() string {
 	}
 	if m.screen == screenRootFolderManage {
 		return m.viewRootFolderManage()
+	}
+	if m.screen == screenRepoSelect {
+		return m.viewRepoSelect()
 	}
 	return m.viewList()
 }
@@ -1906,12 +2239,12 @@ func (m model) viewRootFolderManage() string {
 	} else {
 		for i, folder := range m.rootFolders {
 			style := lipgloss.NewStyle().Padding(0, 2)
-			
+
 			// Highlight cursor
 			if i == m.rootFolderCursor {
 				style = style.Background(lipgloss.Color("#333333"))
 			}
-			
+
 			// Format folder entry
 			prefix := "  "
 			if folder.IsActive {
@@ -1920,19 +2253,19 @@ func (m model) viewRootFolderManage() string {
 			} else {
 				style = style.Foreground(lipgloss.Color("#FFFFFF"))
 			}
-			
+
 			name := folder.Name
 			path := folder.Path
-			
+
 			// Show gist sync status
 			gistStatus := ""
 			if folder.GistID != "" {
 				gistStatus = " ☁"
 			}
-			
+
 			line := fmt.Sprintf("%s%s%s", prefix, name, gistStatus)
 			s += style.Render(line) + "\n"
-			
+
 			// Show path in gray
 			pathStyle := lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#888888")).
@@ -1961,6 +2294,202 @@ func (m model) viewRootFolderManage() string {
 		statusView := lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#00AA00")).
 			Render("\n✓ " + m.statusMessage)
+		s += statusView
+	}
+
+	return docStyle.Render(s)
+}
+
+// viewRepoSelect renders the GitHub repository selection screen
+func (m model) viewRepoSelect() string {
+	// Title box
+	titleBox := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#00FFFF")).
+		Padding(0, 2).
+		Bold(true).
+		Foreground(lipgloss.Color("#00FFFF")).
+		Render("Select GitHub Repository to Clone")
+
+	s := "\n" + titleBox + "\n\n"
+
+	// Instructions box
+	instructionsBox := lipgloss.NewStyle().
+		Width(68).
+		Padding(1, 2).
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color("#444444")).
+		Render(
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Render("Select a repository to clone from your GitHub account") + "\n" +
+				lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Render("Repositories are sorted by most recently updated"),
+		)
+	s += instructionsBox + "\n\n"
+
+	// Show filter input if filtering is active
+	if m.repoFiltering {
+		filterBox := lipgloss.NewStyle().
+			Width(68).
+			Padding(0, 2).
+			Border(lipgloss.NormalBorder()).
+			BorderForeground(lipgloss.Color("#00FFFF")).
+			Render(m.repoFilterInput.View())
+		s += filterBox + "\n\n"
+	}
+
+	// Get filtered repositories
+	filteredRepos := m.getFilteredRepos()
+
+	// Repository list header with count
+	repoCountInfo := ""
+	if m.repoFilterInput.Value() != "" {
+		repoCountInfo = fmt.Sprintf(" (%d of %d)", len(filteredRepos), len(m.userRepos))
+	}
+	repoListHeader := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#00FFFF")).
+		Bold(true).
+		Render(fmt.Sprintf("Your Repositories (%d total)%s:", len(m.userRepos), repoCountInfo))
+	s += repoListHeader + "\n\n"
+
+	// If no repositories match filter
+	if len(filteredRepos) == 0 {
+		noResultsMsg := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#888888")).
+			Render("  No repositories match the filter")
+		s += noResultsMsg + "\n"
+	}
+
+	// Calculate visible window for scrolling
+	maxVisible := 15
+	startIdx := 0
+	endIdx := len(filteredRepos)
+
+	// Find current cursor position in filtered list
+	cursorPosInFiltered := -1
+	for i, repo := range filteredRepos {
+		if m.repoCursorIndex < len(m.userRepos) && repo.ID == m.userRepos[m.repoCursorIndex].ID {
+			cursorPosInFiltered = i
+			break
+		}
+	}
+
+	// Adjust visible window if needed
+	if cursorPosInFiltered >= 0 {
+		if cursorPosInFiltered >= maxVisible {
+			startIdx = cursorPosInFiltered - maxVisible + 1
+		}
+		if endIdx > startIdx+maxVisible {
+			endIdx = startIdx + maxVisible
+		}
+	} else if endIdx > maxVisible {
+		endIdx = maxVisible
+	}
+
+	// Show scroll indicator if needed
+	if startIdx > 0 {
+		s += lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#888888")).
+			Render("  ▲ More repositories above...\n")
+	}
+
+	// List repositories with cursor
+	for i := startIdx; i < endIdx && i < len(filteredRepos); i++ {
+		repo := filteredRepos[i]
+
+		// Check if this is the cursor position
+		isCursor := false
+		if m.repoCursorIndex < len(m.userRepos) && repo.ID == m.userRepos[m.repoCursorIndex].ID {
+			isCursor = true
+		}
+
+		// Cursor indicator
+		cursor := "  "
+		if isCursor {
+			cursor = "► "
+		}
+
+		// Repository name with owner
+		repoName := repo.FullName
+		if len(repoName) > 50 {
+			repoName = repoName[:47] + "..."
+		}
+
+		// Language badge
+		language := repo.Language
+		if language == "" {
+			language = "Unknown"
+		}
+		langBadge := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#00AA00")).
+			Render(fmt.Sprintf("[%s]", language))
+
+		// Private/Public indicator
+		visibility := "public"
+		visColor := "#00FFFF"
+		if repo.Private {
+			visibility = "private"
+			visColor = "#FFAA00"
+		}
+		visBadge := lipgloss.NewStyle().
+			Foreground(lipgloss.Color(visColor)).
+			Render(fmt.Sprintf("(%s)", visibility))
+
+		// Description
+		desc := repo.Description
+		if desc == "" {
+			desc = "No description"
+		}
+		if len(desc) > 60 {
+			desc = desc[:57] + "..."
+		}
+
+		// Style based on cursor position
+		lineStyle := lipgloss.NewStyle()
+		if isCursor {
+			lineStyle = lineStyle.
+				Background(lipgloss.Color("#444444")).
+				Foreground(lipgloss.Color("#FFFFFF")).
+				Bold(true)
+		} else {
+			lineStyle = lineStyle.
+				Foreground(lipgloss.Color("#FFFFFF"))
+		}
+
+		line := fmt.Sprintf("%s%s %s %s", cursor, repoName, langBadge, visBadge)
+		s += lineStyle.Render(line) + "\n"
+
+		// Add description on second line if cursor is here
+		if isCursor {
+			descLine := lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#888888")).
+				Render(fmt.Sprintf("    %s", desc))
+			s += descLine + "\n"
+		}
+	}
+
+	// Show scroll indicator if needed
+	if endIdx < len(filteredRepos) {
+		s += lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#888888")).
+			Render("  ▼ More repositories below...\n")
+	}
+
+	// Compact help text
+	helpText := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#888888")).
+		Render("\n↑↓/jk=navigate  /=filter  enter=clone  esc=cancel")
+	s += helpText
+
+	// Display error message if present
+	if m.errorMessage != "" {
+		errorView := errorStyle.Render(fmt.Sprintf("\n\n⚠ %s", m.errorMessage))
+		s += errorView
+	}
+
+	// Display status message if present
+	if m.statusMessage != "" {
+		statusView := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#00AA00")).
+			Render(fmt.Sprintf("\n\n✓ %s", m.statusMessage))
 		s += statusView
 	}
 
@@ -2026,7 +2555,7 @@ func (m model) viewList() string {
 			m.cloneInput.View() + "\n\n" +
 			lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#888888")).
-				Render("Press Enter to clone | ESC to cancel")
+				Render("Press Enter to clone | 'b' to browse your repos | ESC to cancel")
 	}
 
 	// Add archive confirmation dialog if in archive mode
@@ -2127,7 +2656,7 @@ func (m model) viewList() string {
 		// Token configured
 		helpText = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#888888")).
-			Render("\n\nKeys: enter=open  o=browser  x=run  s=scan  g=clone  f=folders  u=sync-up  l=select-cloud  t=github-oauth  c=clear-all  d=archive  r=restore  /=filter  q=quit")
+			Render("\n\nKeys: enter=open  o=browser  x=run  s=scan  g=clone  b=browse-repos  f=folders  u=sync-up  l=select-cloud  t=github-oauth  c=clear-all  d=archive  r=restore  /=filter  q=quit")
 	}
 
 	// Build output without extra docStyle wrapping to avoid layout issues
@@ -2481,7 +3010,7 @@ func scanProjectsWithPathCmd(scanPath string) tea.Cmd {
 		if err == nil && activeRoot != nil {
 			rootFolderID = activeRoot.ID
 		}
-		
+
 		// Set the RootFolderID for all scanned projects
 		for i := range projects {
 			projects[i].RootFolderID = rootFolderID
@@ -2742,6 +3271,28 @@ func listCloudProjectsCmd() tea.Cmd {
 	}
 }
 
+// fetchUserReposCmd creates a command that fetches the user's GitHub repositories
+func fetchUserReposCmd() tea.Cmd {
+	return func() tea.Msg {
+		// Get GitHub token from config
+		token, err := db.GetConfig("github_token")
+		if err != nil || token == "" {
+			return FetchReposMsg{err: fmt.Errorf("GitHub authentication required. Please authenticate with OAuth (press 't')")}
+		}
+
+		// Create OAuth client
+		oauthClient := engine.NewOAuthClient()
+
+		// Fetch user repositories
+		repos, err := oauthClient.FetchUserRepositories(token)
+		if err != nil {
+			return FetchReposMsg{err: fmt.Errorf("failed to fetch repositories: %w", err)}
+		}
+
+		return FetchReposMsg{repos: repos}
+	}
+}
+
 // loadSelectedProjectsCmd creates a command that loads selected projects from cloud
 func loadSelectedProjectsCmd(selectedIndices []int, cloudProjects []models.Project) tea.Cmd {
 	return func() tea.Msg {
@@ -2859,4 +3410,25 @@ func (m model) getFilteredIndices() []int {
 		}
 	}
 	return indices
+}
+
+// getFilteredRepos returns filtered GitHub repositories based on the filter input
+func (m model) getFilteredRepos() []engine.GitHubRepository {
+	filterText := strings.ToLower(strings.TrimSpace(m.repoFilterInput.Value()))
+	if filterText == "" {
+		// No filter - return all repositories
+		return m.userRepos
+	}
+
+	// Filter and return matching repositories
+	repos := []engine.GitHubRepository{}
+	for _, repo := range m.userRepos {
+		if strings.Contains(strings.ToLower(repo.Name), filterText) ||
+			strings.Contains(strings.ToLower(repo.FullName), filterText) ||
+			strings.Contains(strings.ToLower(repo.Description), filterText) ||
+			strings.Contains(strings.ToLower(repo.Language), filterText) {
+			repos = append(repos, repo)
+		}
+	}
+	return repos
 }

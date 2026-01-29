@@ -58,7 +58,7 @@ func (c *OAuthClient) InitiateDeviceFlow() (*DeviceCodeResponse, error) {
 
 	data := map[string]string{
 		"client_id": c.ClientID,
-		"scope":     "gist",
+		"scope":     "gist repo",
 	}
 
 	jsonData, err := json.Marshal(data)
@@ -213,4 +213,72 @@ func (c *OAuthClient) ValidateToken(token string) error {
 	}
 
 	return nil
+}
+
+// GitHubRepository represents a GitHub repository from the API
+type GitHubRepository struct {
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	FullName    string `json:"full_name"`
+	Description string `json:"description"`
+	CloneURL    string `json:"clone_url"`
+	HTMLURL     string `json:"html_url"`
+	Private     bool   `json:"private"`
+	Language    string `json:"language"`
+	UpdatedAt   string `json:"updated_at"`
+}
+
+// FetchUserRepositories retrieves all repositories for the authenticated user
+func (c *OAuthClient) FetchUserRepositories(token string) ([]GitHubRepository, error) {
+	var allRepos []GitHubRepository
+	page := 1
+	perPage := 100
+
+	for {
+		url := fmt.Sprintf("https://api.github.com/user/repos?per_page=%d&page=%d&sort=updated&visibility=all&affiliation=owner,collaborator,organization_member", perPage, page)
+
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+		client := &http.Client{Timeout: 30 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch repositories: %w", err)
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read response: %w", err)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("GitHub API error: %d - %s", resp.StatusCode, string(body))
+		}
+
+		var repos []GitHubRepository
+		if err := json.Unmarshal(body, &repos); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+		}
+
+		if len(repos) == 0 {
+			break
+		}
+
+		allRepos = append(allRepos, repos...)
+
+		// If we got fewer than perPage results, we're done
+		if len(repos) < perPage {
+			break
+		}
+
+		page++
+	}
+
+	return allRepos, nil
 }
