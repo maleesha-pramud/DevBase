@@ -1,7 +1,10 @@
 package ui
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -111,6 +114,12 @@ type OAuthDeviceCodeMsg struct {
 type OAuthCompleteMsg struct {
 	accessToken string
 	err         error
+}
+
+// GitHubUsernameMsg is sent when fetching GitHub username completes
+type GitHubUsernameMsg struct {
+	username string
+	err      error
 }
 
 // projectItem wraps a Project and implements the list.Item interface
@@ -603,6 +612,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusMessage = ""
 			return m, nil
 
+		case "p":
+			// Open GitHub profile in browser
+			// Check if GitHub token is configured
+			token, err := db.GetConfig("github_token")
+			if err != nil || token == "" {
+				m.errorMessage = "GitHub authentication required. Press 't' to authenticate with OAuth."
+				return m, nil
+			}
+			m.errorMessage = ""
+			m.statusMessage = "Opening your GitHub profile..."
+			return m, getGitHubUsernameCmd()
+
 		case "f":
 			// Manage root folders
 			m.screen = screenRootFolderManage
@@ -695,6 +716,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusMessage = "Repository opened in browser"
 		}
 		return m, nil
+
+	case GitHubUsernameMsg:
+		// Handle GitHub username fetch completion
+		if msg.err != nil {
+			m.errorMessage = fmt.Sprintf("Failed to get GitHub username: %v", msg.err)
+			m.statusMessage = ""
+			return m, nil
+		}
+		// Open GitHub profile in browser
+		profileURL := "https://github.com/" + msg.username
+		m.statusMessage = "Opening GitHub profile in browser..."
+		return m, openBrowserCmd(profileURL)
 
 	case RunProjectMsg:
 		// Handle project run completion
@@ -2656,7 +2689,7 @@ func (m model) viewList() string {
 		// Token configured
 		helpText = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#888888")).
-			Render("\n\nKeys: enter=open  o=browser  x=run  s=scan  g=clone  b=browse-repos  f=folders  u=sync-up  l=select-cloud  t=github-oauth  c=clear-all  d=archive  r=restore  /=filter  q=quit")
+			Render("\n\nKeys: enter=open  o=browser  x=run  s=scan  g=clone  b=browse-repos  p=github-profile  f=folders  u=sync-up  l=select-cloud  t=github-oauth  c=clear-all  d=archive  r=restore  /=filter  q=quit")
 	}
 
 	// Build output without extra docStyle wrapping to avoid layout issues
@@ -3369,6 +3402,56 @@ func pollForAccessTokenCmd(deviceCode string, interval int) tea.Cmd {
 		return OAuthCompleteMsg{
 			accessToken: accessToken,
 			err:         nil,
+		}
+	}
+}
+
+// getGitHubUsernameCmd creates a command that fetches the authenticated user's GitHub username
+func getGitHubUsernameCmd() tea.Cmd {
+	return func() tea.Msg {
+		// Get GitHub token from config
+		token, err := db.GetConfig("github_token")
+		if err != nil || token == "" {
+			return GitHubUsernameMsg{err: fmt.Errorf("GitHub authentication required")}
+		}
+
+		// Make API request to get user info
+		req, err := http.NewRequest("GET", "https://api.github.com/user", nil)
+		if err != nil {
+			return GitHubUsernameMsg{err: fmt.Errorf("failed to create request: %w", err)}
+		}
+
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			return GitHubUsernameMsg{err: fmt.Errorf("failed to fetch user info: %w", err)}
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			return GitHubUsernameMsg{err: fmt.Errorf("GitHub API error: %d - %s", resp.StatusCode, string(body))}
+		}
+
+		// Parse response
+		var userInfo struct {
+			Login string `json:"login"`
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return GitHubUsernameMsg{err: fmt.Errorf("failed to read response: %w", err)}
+		}
+
+		if err := json.Unmarshal(body, &userInfo); err != nil {
+			return GitHubUsernameMsg{err: fmt.Errorf("failed to parse response: %w", err)}
+		}
+
+		return GitHubUsernameMsg{
+			username: userInfo.Login,
+			err:      nil,
 		}
 	}
 }
