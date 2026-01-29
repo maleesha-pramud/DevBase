@@ -155,6 +155,24 @@ func (c *GistClient) SaveToGist(projects []models.Project) error {
 		return fmt.Errorf("failed to read response: %w", err)
 	}
 
+	// Handle 404 - gist was deleted, create a new one
+	if resp.StatusCode == 404 && c.GistID != "" {
+		// Clear the old gist ID
+		c.GistID = ""
+		if c.RootFolderID > 0 {
+			rootFolder, err := db.GetRootFolderByID(c.RootFolderID)
+			if err == nil {
+				rootFolder.GistID = ""
+				db.UpdateRootFolder(rootFolder)
+			}
+		} else {
+			db.SetConfig("gist_id", "")
+		}
+
+		// Retry as a POST to create new gist
+		return c.SaveToGist(projects)
+	}
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("GitHub API error: %s", string(body))
 	}
