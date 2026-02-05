@@ -1,3 +1,4 @@
+~~code execution (user must be able to execute codes from the tool that code must be execute in the root directory)~~ ✓ COMPLETED - Press 'f' to manage root folders, then press 'e' to execute commands in the selected root folder
 Add remove update status update todo functionality
 
 New project creating functionality. Get project name, stack((nodejs,express, MySQL), (html, css, js), (react, tailwind), (nextjs, tailwind)) and status (private, public) initialize project(create project and install tools) do initial setup(tailwind like tools setup) and create git repo according to the status.

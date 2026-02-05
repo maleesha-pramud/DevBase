@@ -63,6 +63,13 @@ type RunProjectMsg struct {
 	err         error
 }
 
+// ExecuteCommandMsg is sent when executing a custom command completes
+type ExecuteCommandMsg struct {
+	projectPath string
+	command     string
+	err         error
+}
+
 // ScanCompleteMsg is sent when directory scan completes
 type ScanCompleteMsg struct {
 	projectsFound   int
@@ -210,34 +217,36 @@ type FetchReposMsg struct {
 
 // model represents the Bubble Tea application model
 type model struct {
-	screen               screenState
-	pathInput            textinput.Model
-	tokenInput           textinput.Model
-	list                 list.Model
-	errorMessage         string
-	statusMessage        string
-	isScanning           bool
-	confirmClearAll      bool
-	confirmArchive       bool
-	archiveConfirmInput  textinput.Model
-	archiveProject       *projectItem
-	archiveIdx           int
-	confirmClone         bool
-	cloneInput           textinput.Model
-	cloneMode            string // "url" or "select"
-	userRepos            []engine.GitHubRepository
-	repoFilterInput      textinput.Model
-	repoCursorIndex      int
-	repoFiltering        bool
-	cloudProjects        []models.Project
-	selectedCloudIndices []int
-	cloudCursorIndex     int
-	cloudFilterInput     textinput.Model
-	cloudFiltering       bool
-	rootScanPath         string
-	width                int
-	height               int
-	ready                bool
+	screen                screenState
+	pathInput             textinput.Model
+	tokenInput            textinput.Model
+	list                  list.Model
+	errorMessage          string
+	statusMessage         string
+	isScanning            bool
+	confirmClearAll       bool
+	confirmArchive        bool
+	archiveConfirmInput   textinput.Model
+	archiveProject        *projectItem
+	archiveIdx            int
+	confirmClone          bool
+	cloneInput            textinput.Model
+	cloneMode             string // "url" or "select"
+	confirmExecuteCommand bool
+	executeCommandInput   textinput.Model
+	userRepos             []engine.GitHubRepository
+	repoFilterInput       textinput.Model
+	repoCursorIndex       int
+	repoFiltering         bool
+	cloudProjects         []models.Project
+	selectedCloudIndices  []int
+	cloudCursorIndex      int
+	cloudFilterInput      textinput.Model
+	cloudFiltering        bool
+	rootScanPath          string
+	width                 int
+	height                int
+	ready                 bool
 	// OAuth flow fields
 	oauthDeviceCode      string
 	oauthUserCode        string
@@ -695,6 +704,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusMessage = fmt.Sprintf("Successfully cloned %s", msg.projectName)
 			// Reload the list to show the new project
 			return m, reloadProjectsCmd()
+		}
+		return m, nil
+
+	case ExecuteCommandMsg:
+		// Handle custom command execution completion
+		if msg.err != nil {
+			m.errorMessage = fmt.Sprintf("Command execution failed: %v", msg.err)
+			m.statusMessage = ""
+		} else {
+			m.errorMessage = ""
+			m.statusMessage = "Command executed successfully"
 		}
 		return m, nil
 
@@ -1620,6 +1640,47 @@ func (m model) updateRepoSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) updateRootFolderManage(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		// If in execute command input mode
+		if m.confirmExecuteCommand {
+			switch msg.String() {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "enter":
+				command := m.executeCommandInput.Value()
+				if command == "" {
+					m.errorMessage = "Please enter a valid command"
+					return m, nil
+				}
+
+				if len(m.rootFolders) == 0 {
+					m.errorMessage = "No root folders available"
+					m.confirmExecuteCommand = false
+					return m, nil
+				}
+
+				// Get selected root folder
+				selectedFolder := m.rootFolders[m.rootFolderCursor]
+
+				// Clear confirmation state
+				m.confirmExecuteCommand = false
+				m.statusMessage = "Executing command..."
+				m.errorMessage = ""
+
+				// Execute command in root folder
+				return m, executeCommandCmd(selectedFolder.Path, command)
+			case "esc":
+				m.confirmExecuteCommand = false
+				m.statusMessage = "Command execution cancelled"
+				m.errorMessage = ""
+				return m, nil
+			default:
+				// Pass other keys to the text input
+				var cmd tea.Cmd
+				m.executeCommandInput, cmd = m.executeCommandInput.Update(msg)
+				return m, cmd
+			}
+		}
+
 		// If adding a new root folder
 		if m.addingRootFolder {
 			switch msg.String() {
@@ -1797,6 +1858,32 @@ func (m model) updateRootFolderManage(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusMessage = fmt.Sprintf("Scanning %s...", selectedFolder.Name)
 			m.errorMessage = ""
 			return m, scanRootFolderCmd(selectedFolder.ID, selectedFolder.Path)
+
+		case "e":
+			// Execute a custom command in the selected root folder
+			if len(m.rootFolders) == 0 {
+				m.errorMessage = "No root folders available"
+				return m, nil
+			}
+
+			if m.confirmExecuteCommand {
+				return m, nil // Already in execute command mode
+			}
+
+			// Enter execute command mode
+			m.confirmExecuteCommand = true
+			m.errorMessage = ""
+			m.statusMessage = ""
+
+			// Create command input
+			cmdInput := textinput.New()
+			cmdInput.Placeholder = "e.g., npm test, go build, python script.py"
+			cmdInput.Focus()
+			cmdInput.CharLimit = 500
+			cmdInput.Width = 60
+			m.executeCommandInput = cmdInput
+
+			return m, textinput.Blink
 		}
 	}
 
@@ -2310,10 +2397,34 @@ func (m model) viewRootFolderManage() string {
 		}
 	}
 
+	// Execute command prompt if in execute mode
+	if m.confirmExecuteCommand && len(m.rootFolders) > 0 {
+		selectedFolder := m.rootFolders[m.rootFolderCursor]
+		executePrompt := "\n\n" +
+			lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#00FFFF")).
+				Bold(true).
+				Render("⚡ EXECUTE COMMAND") + "\n\n" +
+			lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#FFFFFF")).
+				Render(fmt.Sprintf("Root Folder: %s", selectedFolder.Name)) + "\n" +
+			lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#888888")).
+				Render(fmt.Sprintf("Path: %s", selectedFolder.Path)) + "\n\n" +
+			lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#FFFFFF")).
+				Render("Enter command to execute:") + "\n" +
+			m.executeCommandInput.View() + "\n\n" +
+			lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#888888")).
+				Render("Press Enter to execute | ESC to cancel")
+		s += executePrompt
+	}
+
 	// Help text
 	helpText := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#888888")).
-		Render("\n\nKeys: ↑↓/jk=navigate  enter=switch  a=add  d=delete  s=scan  esc=back  q=quit")
+		Render("\n\nKeys: ↑↓/jk=navigate  enter=switch  a=add  d=delete  s=scan  e=execute  esc=back  q=quit")
 	s += helpText
 
 	// Display error message if present
@@ -2736,31 +2847,33 @@ func NewModel() (model, error) {
 		cloudFilter.Width = 50
 
 		return model{
-			screen:               screenSetupPath,
-			pathInput:            ti,
-			tokenInput:           textinput.New(),
-			list:                 l,
-			errorMessage:         "",
-			statusMessage:        "",
-			isScanning:           false,
-			confirmClearAll:      false,
-			confirmArchive:       false,
-			confirmClone:         false,
-			cloneInput:           textinput.New(),
-			cloudProjects:        nil,
-			selectedCloudIndices: nil,
-			cloudCursorIndex:     0,
-			cloudFilterInput:     cloudFilter,
-			cloudFiltering:       false,
-			rootScanPath:         rootPath,
-			width:                80,
-			height:               24,
-			ready:                false,
-			rootFolders:          nil,
-			rootFolderCursor:     0,
-			activeRootFolderID:   0,
-			rootFolderInput:      textinput.New(),
-			addingRootFolder:     false,
+			screen:                screenSetupPath,
+			pathInput:             ti,
+			tokenInput:            textinput.New(),
+			list:                  l,
+			errorMessage:          "",
+			statusMessage:         "",
+			isScanning:            false,
+			confirmClearAll:       false,
+			confirmArchive:        false,
+			confirmClone:          false,
+			cloneInput:            textinput.New(),
+			confirmExecuteCommand: false,
+			executeCommandInput:   textinput.New(),
+			cloudProjects:         nil,
+			selectedCloudIndices:  nil,
+			cloudCursorIndex:      0,
+			cloudFilterInput:      cloudFilter,
+			cloudFiltering:        false,
+			rootScanPath:          rootPath,
+			width:                 80,
+			height:                24,
+			ready:                 false,
+			rootFolders:           nil,
+			rootFolderCursor:      0,
+			activeRootFolderID:    0,
+			rootFolderInput:       textinput.New(),
+			addingRootFolder:      false,
 		}, nil
 	}
 
@@ -2778,31 +2891,33 @@ func NewModel() (model, error) {
 	cloudFilter.Width = 50
 
 	return model{
-		screen:               screenList,
-		pathInput:            textinput.New(),
-		tokenInput:           textinput.New(),
-		list:                 l,
-		errorMessage:         "",
-		statusMessage:        "",
-		isScanning:           false,
-		confirmClearAll:      false,
-		confirmArchive:       false,
-		confirmClone:         false,
-		cloneInput:           textinput.New(),
-		cloudProjects:        nil,
-		selectedCloudIndices: nil,
-		cloudCursorIndex:     0,
-		cloudFilterInput:     cloudFilter,
-		cloudFiltering:       false,
-		rootScanPath:         rootPath,
-		width:                80,
-		height:               24,
-		ready:                false,
-		rootFolders:          nil,
-		rootFolderCursor:     0,
-		activeRootFolderID:   0,
-		rootFolderInput:      textinput.New(),
-		addingRootFolder:     false,
+		screen:                screenList,
+		pathInput:             textinput.New(),
+		tokenInput:            textinput.New(),
+		list:                  l,
+		errorMessage:          "",
+		statusMessage:         "",
+		isScanning:            false,
+		confirmClearAll:       false,
+		confirmArchive:        false,
+		confirmClone:          false,
+		cloneInput:            textinput.New(),
+		confirmExecuteCommand: false,
+		executeCommandInput:   textinput.New(),
+		cloudProjects:         nil,
+		selectedCloudIndices:  nil,
+		cloudCursorIndex:      0,
+		cloudFilterInput:      cloudFilter,
+		cloudFiltering:        false,
+		rootScanPath:          rootPath,
+		width:                 80,
+		height:                24,
+		ready:                 false,
+		rootFolders:           nil,
+		rootFolderCursor:      0,
+		activeRootFolderID:    0,
+		rootFolderInput:       textinput.New(),
+		addingRootFolder:      false,
 	}, nil
 }
 
@@ -2881,6 +2996,33 @@ func runProjectCmd(projectPath string) tea.Cmd {
 		err = terminalCmd.Start()
 		return RunProjectMsg{
 			projectPath: projectPath,
+			err:         err,
+		}
+	}
+}
+
+// executeCommandCmd creates a command that executes a custom command in the project's root directory
+func executeCommandCmd(projectPath string, command string) tea.Cmd {
+	return func() tea.Msg {
+		if projectPath == "" {
+			return ExecuteCommandMsg{
+				projectPath: projectPath,
+				command:     command,
+				err:         fmt.Errorf("no project path provided"),
+			}
+		}
+
+		// Build the full command string - change to project directory and execute the command
+		// PowerShell command to open a new PowerShell window, change directory, and execute command
+		psCommand := fmt.Sprintf("Start-Process powershell -ArgumentList '-NoExit', '-Command', 'Set-Location -Path \"%s\"; %s'", projectPath, command)
+
+		// Open new PowerShell window with the command
+		terminalCmd := exec.Command("powershell", "-Command", psCommand)
+
+		err := terminalCmd.Start()
+		return ExecuteCommandMsg{
+			projectPath: projectPath,
+			command:     command,
 			err:         err,
 		}
 	}

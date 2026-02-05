@@ -89,8 +89,10 @@ INTERACTIVE MODE (default):
 KEYBOARD SHORTCUTS:
     enter           Open project in VS Code
     s               Scan for new projects
+    x               Run project in development mode
     d               Archive selected project (deletes directory)
     r               Restore archived project (clones from repo)
+    f               Manage root folders (press 'e' there to execute commands)
     /               Filter/search projects
     q, ctrl+c       Quit
 
