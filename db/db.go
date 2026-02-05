@@ -301,13 +301,13 @@ func SetActiveRootFolder(id uint) error {
 // DeleteRootFolder deletes a root folder and all its associated projects
 func DeleteRootFolder(id uint) error {
 	return DB.Transaction(func(tx *gorm.DB) error {
-		// Delete all projects in this root folder
-		if err := tx.Where("root_folder_id = ?", id).Delete(&models.Project{}).Error; err != nil {
+		// Delete all projects in this root folder (hard delete to allow re-adding)
+		if err := tx.Unscoped().Where("root_folder_id = ?", id).Delete(&models.Project{}).Error; err != nil {
 			return fmt.Errorf("failed to delete projects: %w", err)
 		}
 
-		// Delete the root folder
-		if err := tx.Delete(&models.RootFolder{}, id).Error; err != nil {
+		// Delete the root folder (hard delete to allow re-adding same path)
+		if err := tx.Unscoped().Delete(&models.RootFolder{}, id).Error; err != nil {
 			return fmt.Errorf("failed to delete root folder: %w", err)
 		}
 

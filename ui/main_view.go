@@ -253,11 +253,13 @@ type model struct {
 	oauthVerificationURI string
 	oauthInterval        int
 	// Root folder management fields
-	rootFolders        []models.RootFolder
-	rootFolderCursor   int
-	activeRootFolderID uint
-	rootFolderInput    textinput.Model
-	addingRootFolder   bool
+	rootFolders                []models.RootFolder
+	rootFolderCursor           int
+	activeRootFolderID         uint
+	rootFolderInput            textinput.Model
+	addingRootFolder           bool
+	confirmingDeleteRootFolder bool
+	rootFolderToDelete         *models.RootFolder
 }
 
 // Init initializes the model and loads projects from the database
@@ -1748,7 +1750,14 @@ func (m model) updateRootFolderManage(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case "esc":
-			// Return to main screen
+			// If confirming deletion, cancel it
+			if m.confirmingDeleteRootFolder {
+				m.confirmingDeleteRootFolder = false
+				m.rootFolderToDelete = nil
+				m.statusMessage = "Deletion cancelled"
+				return m, nil
+			}
+			// Otherwise return to main screen
 			m.screen = screenList
 			m.errorMessage = ""
 			m.statusMessage = ""
@@ -1822,30 +1831,56 @@ func (m model) updateRootFolderManage(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
-			if err := db.DeleteRootFolder(selectedFolder.ID); err != nil {
-				m.errorMessage = fmt.Sprintf("Failed to delete root folder: %v", err)
-				return m, nil
-			}
-
-			// Reload root folders
-			rootFolders, err := db.GetAllRootFolders()
-			if err != nil {
-				m.errorMessage = fmt.Sprintf("Failed to reload root folders: %v", err)
-				return m, nil
-			}
-			m.rootFolders = rootFolders
-
-			// Adjust cursor if needed
-			if m.rootFolderCursor >= len(m.rootFolders) {
-				m.rootFolderCursor = len(m.rootFolders) - 1
-				if m.rootFolderCursor < 0 {
-					m.rootFolderCursor = 0
-				}
-			}
-
-			m.statusMessage = "Root folder deleted"
+			// Show confirmation dialog
+			m.confirmingDeleteRootFolder = true
+			m.rootFolderToDelete = &selectedFolder
 			m.errorMessage = ""
+			m.statusMessage = ""
 			return m, nil
+
+		case "y":
+			// Confirm deletion
+			if m.confirmingDeleteRootFolder && m.rootFolderToDelete != nil {
+				if err := db.DeleteRootFolder(m.rootFolderToDelete.ID); err != nil {
+					m.errorMessage = fmt.Sprintf("Failed to remove root folder: %v", err)
+					m.confirmingDeleteRootFolder = false
+					m.rootFolderToDelete = nil
+					return m, nil
+				}
+
+				// Reload root folders
+				rootFolders, err := db.GetAllRootFolders()
+				if err != nil {
+					m.errorMessage = fmt.Sprintf("Failed to reload root folders: %v", err)
+					m.confirmingDeleteRootFolder = false
+					m.rootFolderToDelete = nil
+					return m, nil
+				}
+				m.rootFolders = rootFolders
+
+				// Adjust cursor if needed
+				if m.rootFolderCursor >= len(m.rootFolders) {
+					m.rootFolderCursor = len(m.rootFolders) - 1
+					if m.rootFolderCursor < 0 {
+						m.rootFolderCursor = 0
+					}
+				}
+
+				m.statusMessage = "Root folder removed from list"
+				m.errorMessage = ""
+				m.confirmingDeleteRootFolder = false
+				m.rootFolderToDelete = nil
+				return m, nil
+			}
+
+		case "n":
+			// Cancel deletion
+			if m.confirmingDeleteRootFolder {
+				m.confirmingDeleteRootFolder = false
+				m.rootFolderToDelete = nil
+				m.statusMessage = "Deletion cancelled"
+				return m, nil
+			}
 
 		case "s":
 			// Scan the selected root folder
@@ -2338,6 +2373,30 @@ func (m model) viewRootFolderManage() string {
 		Render("Manage Root Folders")
 
 	s := "\n" + titleBox + "\n\n"
+
+	// If confirming deletion
+	if m.confirmingDeleteRootFolder && m.rootFolderToDelete != nil {
+		s += lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FF0000")).
+			Bold(true).
+			Render("⚠  CONFIRM REMOVAL\n\n")
+		s += lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Render(fmt.Sprintf("Remove root folder: %s\n", m.rootFolderToDelete.Name))
+		s += lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#888888")).
+			Render(fmt.Sprintf("Path: %s\n\n", m.rootFolderToDelete.Path))
+		s += lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFAA00")).
+			Render("This will remove the folder from DevBase and delete all its project entries.\n")
+		s += lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#888888")).
+			Render("The actual folder on disk will NOT be deleted.\n\n")
+		s += lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Render("Press 'y' to confirm | 'n' or ESC to cancel")
+		return docStyle.Render(s)
+	}
 
 	// If adding a new root folder
 	if m.addingRootFolder {
@@ -2847,33 +2906,35 @@ func NewModel() (model, error) {
 		cloudFilter.Width = 50
 
 		return model{
-			screen:                screenSetupPath,
-			pathInput:             ti,
-			tokenInput:            textinput.New(),
-			list:                  l,
-			errorMessage:          "",
-			statusMessage:         "",
-			isScanning:            false,
-			confirmClearAll:       false,
-			confirmArchive:        false,
-			confirmClone:          false,
-			cloneInput:            textinput.New(),
-			confirmExecuteCommand: false,
-			executeCommandInput:   textinput.New(),
-			cloudProjects:         nil,
-			selectedCloudIndices:  nil,
-			cloudCursorIndex:      0,
-			cloudFilterInput:      cloudFilter,
-			cloudFiltering:        false,
-			rootScanPath:          rootPath,
-			width:                 80,
-			height:                24,
-			ready:                 false,
-			rootFolders:           nil,
-			rootFolderCursor:      0,
-			activeRootFolderID:    0,
-			rootFolderInput:       textinput.New(),
-			addingRootFolder:      false,
+			screen:                     screenSetupPath,
+			pathInput:                  ti,
+			tokenInput:                 textinput.New(),
+			list:                       l,
+			errorMessage:               "",
+			statusMessage:              "",
+			isScanning:                 false,
+			confirmClearAll:            false,
+			confirmArchive:             false,
+			confirmClone:               false,
+			cloneInput:                 textinput.New(),
+			confirmExecuteCommand:      false,
+			executeCommandInput:        textinput.New(),
+			cloudProjects:              nil,
+			selectedCloudIndices:       nil,
+			cloudCursorIndex:           0,
+			cloudFilterInput:           cloudFilter,
+			cloudFiltering:             false,
+			rootScanPath:               rootPath,
+			width:                      80,
+			height:                     24,
+			ready:                      false,
+			rootFolders:                nil,
+			rootFolderCursor:           0,
+			activeRootFolderID:         0,
+			rootFolderInput:            textinput.New(),
+			addingRootFolder:           false,
+			confirmingDeleteRootFolder: false,
+			rootFolderToDelete:         nil,
 		}, nil
 	}
 
@@ -2891,33 +2952,35 @@ func NewModel() (model, error) {
 	cloudFilter.Width = 50
 
 	return model{
-		screen:                screenList,
-		pathInput:             textinput.New(),
-		tokenInput:            textinput.New(),
-		list:                  l,
-		errorMessage:          "",
-		statusMessage:         "",
-		isScanning:            false,
-		confirmClearAll:       false,
-		confirmArchive:        false,
-		confirmClone:          false,
-		cloneInput:            textinput.New(),
-		confirmExecuteCommand: false,
-		executeCommandInput:   textinput.New(),
-		cloudProjects:         nil,
-		selectedCloudIndices:  nil,
-		cloudCursorIndex:      0,
-		cloudFilterInput:      cloudFilter,
-		cloudFiltering:        false,
-		rootScanPath:          rootPath,
-		width:                 80,
-		height:                24,
-		ready:                 false,
-		rootFolders:           nil,
-		rootFolderCursor:      0,
-		activeRootFolderID:    0,
-		rootFolderInput:       textinput.New(),
-		addingRootFolder:      false,
+		screen:                     screenList,
+		pathInput:                  textinput.New(),
+		tokenInput:                 textinput.New(),
+		list:                       l,
+		errorMessage:               "",
+		statusMessage:              "",
+		isScanning:                 false,
+		confirmClearAll:            false,
+		confirmArchive:             false,
+		confirmClone:               false,
+		cloneInput:                 textinput.New(),
+		confirmExecuteCommand:      false,
+		executeCommandInput:        textinput.New(),
+		cloudProjects:              nil,
+		selectedCloudIndices:       nil,
+		cloudCursorIndex:           0,
+		cloudFilterInput:           cloudFilter,
+		cloudFiltering:             false,
+		rootScanPath:               rootPath,
+		width:                      80,
+		height:                     24,
+		ready:                      false,
+		rootFolders:                nil,
+		rootFolderCursor:           0,
+		activeRootFolderID:         0,
+		rootFolderInput:            textinput.New(),
+		addingRootFolder:           false,
+		confirmingDeleteRootFolder: false,
+		rootFolderToDelete:         nil,
 	}, nil
 }
 
