@@ -1,4 +1,4 @@
-# DevBase v1.8.2
+# DevBase v1.8.3
 
 **DevBase** is a high-performance CLI project manager built with Go, featuring optimistic UI updates, concurrent directory scanning, and seamless VS Code integration.
 
@@ -457,4 +457,4 @@ MIT License - See LICENSE file for details
 
 ---
 
-**DevBase v1.8.2** - Built with ❤️ in Go
+**DevBase v1.8.3** - Built with ❤️ in Go
